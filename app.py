@@ -25,8 +25,8 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QLabel, QPushButton, QSlider, QVBoxLayout,
-    QWidget,
+    QApplication, QComboBox, QDialog, QLabel, QMessageBox, QPlainTextEdit,
+    QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from core.alignment import (
@@ -104,7 +104,19 @@ class MainWindow(QWidget):
                             | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
         self.setWindowTitle("加页手记 地图助手")
-        self.setFixedWidth(236)
+        self.setFixedWidth(300)
+
+        # 状态灯：启动/热键成败一目了然（阶段1）
+        self.led = QLabel("● 启动中…")
+        self.led.setWordWrap(True)
+        self.led.setStyleSheet("color:#ffcc66; font-weight:bold; padding:5px; "
+                               "background:#222; border-radius:3px;")
+        # 运行日志区：逐步显示 截屏→图标→匹配→对齐→投影（阶段1）
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(300)
+        self.log_view.setFixedHeight(150)
+        self.log_view.setStyleSheet("background:#1a1a1a; color:#ccc; font-size:11px;")
 
         self.direction_combo = QComboBox(); self.direction_combo.addItems(lib.directions())
         self.door_combo = QComboBox()
@@ -132,6 +144,7 @@ class MainWindow(QWidget):
         self.opacity_slider.valueChanged.connect(self._set_opacity)
 
         root = QVBoxLayout(); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(5)
+        root.addWidget(self.led)
         for text, widget in [("方向（入口朝向）", self.direction_combo),
                              ("门特征", self.door_combo),
                              ("楼层", self.floor_combo),
@@ -148,7 +161,10 @@ class MainWindow(QWidget):
         root.addWidget(QLabel("地图透明度")); root.addWidget(self.opacity_slider)
         self.status = QLabel("就绪。Ctrl+Shift+F 入口匹配（需先按 g 打开地图、刚进入口）。")
         self.status.setStyleSheet("color:#aaa; word-wrap:break-word; font-size:11px;")
-        root.addWidget(self.status); root.addStretch(1)
+        root.addWidget(self.status)
+        root.addWidget(QLabel("运行日志"))
+        root.addWidget(self.log_view)
+        root.addStretch(1)
         self.setLayout(root)
         self.move(8, 60)
         self._on_direction_changed()
@@ -191,6 +207,24 @@ class MainWindow(QWidget):
             return None
         return self.lib.get(self._seed, self.floor_combo.currentText())
 
+    # ---- 状态灯 / 运行日志（阶段1）----
+    def set_led(self, ok: bool, text: str):
+        """启动/热键成败状态灯。ok=True 绿，False 红。"""
+        color = "#66ff66" if ok else "#ff6666"
+        self.led.setText(f"● {text}")
+        self.led.setStyleSheet(f"color:{color}; font-weight:bold; padding:5px; "
+                               f"background:#222; border-radius:3px;")
+
+    def _log_step(self, msg: str, level: str = "INFO"):
+        """一步运行日志：append 进日志区 + 同步 status 一句话。level: INFO/OK/WARN/ERROR。"""
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
+        color = {"ERROR": "#ff6666", "WARN": "#ffcc66", "OK": "#66ff66"}.get(level, "#cccccc")
+        self.log_view.appendHtml(f'<span style="color:{color}">[{ts}] {msg}</span>')
+        sb = self.log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        self.status.setText(msg if len(msg) <= 56 else msg[:53] + "…")
+
     # ---- 捕获 ----
     def _capture(self) -> bool:
         try:
@@ -202,24 +236,40 @@ class MainWindow(QWidget):
             self._last_shot_path = path
             return True
         except Exception as e:  # noqa: BLE001
-            self.status.setText(f"捕获失败: {e}")
+            self._log_step(f"截屏失败: {e}", "ERROR")
             return False
 
     # ---- 一次热键流程：入口引索匹配 → 两段式对齐 → 投影 ----
     def _entrance_pipeline(self):
+        """热键回调入口。顶层兜底：任何步异常进日志区，不冒泡到 nativeEventFilter。"""
+        try:
+            self._entrance_pipeline_impl()
+        except Exception:  # noqa: BLE001
+            import traceback
+            tb = traceback.format_exc()
+            self._log_step("流程异常: " + tb.strip().splitlines()[-1], "ERROR")
+            self._log_step(tb, "ERROR")
+
+    def _entrance_pipeline_impl(self):
         if not self._capture():
             return
+        self._log_step("截屏 OK")
         shot = self._shot
         et = self.entrance_combo.currentText()
         res, icon_pos, isc = find_seed_by_entrance(shot, self.lib, et, top_n=3)
+        if icon_pos is None:
+            self._log_step(f"入口图标未检出(分{isc:.2f}) → 手动选门/3点标定/手框样本", "WARN")
+            self._log(et, res, icon_pos, isc, None, corrected=False)
+            return
+        self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f}")
         if not res:
-            self.status.setText(
-                f"入口匹配失败：入口图标未检出(分{isc:.2f})。请确认入口在视野内，"
-                f"或手动选门/3点标定。")
+            self._log_step("入口匹配无结果 → 手动选门/3点标定/手框样本", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         best = res[0]
         sc, seed, key, fl, _s, _mloc = best
+        self._log_step(f"入口匹配: 种子{seed}({key}[{fl}]) 分{sc:.3f} top3="
+                       + str([(r[1], round(r[0], 3)) for r in res[:3]]), "OK")
         # 填 UI（种子/方向/门/楼层）
         self.floor_combo.blockSignals(True); self.floor_combo.setCurrentText(fl)
         self.floor_combo.blockSignals(False)
@@ -235,15 +285,22 @@ class MainWindow(QWidget):
         if align is not None:
             _M, asc, ov = align
             show_ok = (asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN)
+            self._log_step(f"两段式对齐: 重合分{asc:.3f} 重叠{ov:.2f} "
+                           + ("过闸✓" if show_ok else "不过闸"),
+                           "OK" if show_ok else "WARN")
             if show_ok:
                 info = self.lib.get(seed, fl)
                 if info is not None:
                     rgba = map_to_overlay_rgba(str(info.path), align[0], *self._screen_size())
                     self._show_overlay(rgba)
+                    self._log_step("投影已显示", "OK")
+                else:
+                    self._show_centered_if_any(seed, fl)
             else:
                 self._show_centered_if_any(seed, fl)
         else:
             self._show_centered_if_any(seed, fl)
+            self._log_step("对齐失败(探明不足)，居中显示", "WARN")
 
         confident = (sc < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
         self._log(et, res, icon_pos, isc, align, corrected=False)
@@ -388,8 +445,12 @@ class MainWindow(QWidget):
                     w.writerow(["time", "shot", "entrance", "icon_score", "ix", "iy",
                                 "top3", "overlap", "align_score", "show_gate", "corrected"])
                 w.writerow(row)
-        except Exception:  # noqa: BLE001  日志失败不影响主流程
-            pass
+        except Exception as e:  # noqa: BLE001  CSV 归档失败不影响主流程，但提示用户
+            try:
+                self._log_step(f"日志归档失败: {e}", "WARN")
+            except Exception:  # noqa: BLE001
+                import sys
+                print(f"[log] CSV 归档失败: {e}", file=sys.stderr)
 
     def _mark_wrong(self):
         """把上次截图复制到 eval/inbox/，供定期标注进 labels.csv。"""
@@ -434,9 +495,14 @@ def main():
     hotkeys = HotkeyManager()
     try:
         hotkeys.register(ord("F"), win._entrance_pipeline, MOD_CONTROL | MOD_SHIFT)
-        win.status.setText("就绪。Ctrl+Shift+F 入口匹配+对齐（需先按 g 打开地图、刚进入口）。")
+        win.set_led(True, "已启动 · Ctrl+Shift+F 已注册")
+        win._log_step("热键已注册: Ctrl+Shift+F", "OK")
+        win._log_step("就绪：先按 g 打开游戏地图、刚进入口(图标在视野)，再 Ctrl+Shift+F", "INFO")
     except Exception as e:  # noqa: BLE001
-        win.status.setText(f"热键注册失败: {e}")
+        win.set_led(False, "热键失败")
+        win._log_step(f"热键注册失败: {e}（手动选门/3点标定仍可用）", "ERROR")
+        QMessageBox.warning(win, "热键注册失败",
+            f"{e}\n\n手动选门 + 3 点标定仍可用。\n（自定义热键见后续设置面板）")
     win._hotkeys = hotkeys  # 保引用
 
     sys.exit(app.exec())
