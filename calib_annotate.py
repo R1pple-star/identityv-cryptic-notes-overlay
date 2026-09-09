@@ -82,8 +82,8 @@ def main():
 
     if args and args[0] == "--capture":
         # 实时截屏标注
-        import capture
-        bgr = capture.capture_monitor(1)
+        from ui.capture import capture_monitor
+        bgr = capture_monitor(1)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         out = OUT_DIR / "实时标注.png"
         out_c = OUT_DIR / "实时标注_分类.png"
