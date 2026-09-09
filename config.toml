@@ -1,0 +1,28 @@
+# 加页手记地图工具 — 配置
+# 路径 / 常量 / 阈值全部外置；代码从本文件读，禁止再焊死。
+
+[paths]
+map_library    = "D:/Pictures/20260818摸金地图"   # 28种子×2楼层参考图（素材/答案地图）
+shot_library   = "D:/Videos/NVIDIA/IdentityV"     # 游戏截图测试样本
+assets          = "assets"                         # 项目内素材根（图标模板 + 入口引索）
+icon_template  = "assets/_icon_entrance.png"       # 白箭头入口图标模板
+entrance_index = "assets/entrance_index"           # 入口引索裁图 + _index.json
+captures        = "captures"                       # 运行时截图 + log.csv（gitignore）
+eval_inbox      = "eval/inbox"                      # 用户手动纠正的失败样本回收
+
+[panel]
+# 固定面板坐标，仅 1920x1080 有效（多分辨率 = TODO，现在不做）
+resolution = [1920, 1080]
+rect = [668, 166, 1064, 569]   # x, y, w, h
+
+[vision]
+fog_bgr = [58, 47, 37]   # 迷雾色 BGR：冷色不是中性灰！暖度 -21，会被 classify_region 误判成通路(cls=3)
+fog_tol = 24             # 颜色距离阈值，剔除迷雾
+
+[match]
+score_confident = 0.10   # 入口置信闸：入口分<0.10 且 overlap≥overlap_min 才算种子ID可信
+align_score_max = 0.30   # 对齐显示闸：投影重合分<0.30 且 overlap≥overlap_min 才显示投影（与入口置信闸目的不同，两闸并存）
+overlap_min     = 0.40   # 二次闸，防小模板/小掩膜侥幸低分
+scale_lo  = 0.4          # 种子匹配尺度下界
+scale_hi  = 1.0          # 种子匹配尺度上界（对齐域 ALIGN_SCALES 0.4-1.5）
+scale_step = 0.05        # 别改粗！粗档会擦肩真实尺度→大模板错位、分虚高

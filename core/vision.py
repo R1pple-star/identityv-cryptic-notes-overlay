@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+"""
+视觉原语（从 matcher.py 抽出，Phase 2.1）
+==========================================
+共享视觉底层：读图 / 迷雾色 / 面板坐标 / 颜色分类 / 入口图标检测 / 地图开合。
+引索路径、对齐、校准都依赖本模块。
+
+搬家自 matcher.py，纯移动、逻辑不变。唯一变化：FIXED_PANEL 与入口图标模板路径
+改从 config.toml 读（值与旧硬编码一致，行为不变）。
+"""
+from __future__ import annotations
+
+import tomllib
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+
+# 项目根（core/ 上一层）
+ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_PATH = ROOT / "config.toml"
+
+
+def _load_config():
+    """读 config.toml 的面板坐标与图标模板路径；失败兜底硬编码默认（绝不崩，保证 import 安全）。"""
+    defaults = {
+        "panel_rect": (668, 166, 1064, 569),
+        "icon_template": "_icon_entrance.png",
+    }
+    try:
+        with open(_CONFIG_PATH, "rb") as f:
+            cfg = tomllib.load(f)
+        defaults["panel_rect"] = tuple(cfg["panel"]["rect"])
+        defaults["icon_template"] = cfg["paths"]["icon_template"]
+    except Exception:
+        pass
+    return defaults
+
+
+_CFG = _load_config()
+
+# 地图面板在屏幕上的固定位置（1920x1080）：x, y, 宽, 高。依据用户标注参考图的地图边界白框确定。
+FIXED_PANEL = _CFG["panel_rect"]
+
+# 入口图标模板路径（config.paths.icon_template，相对项目根解析为绝对路径）。
+ICON_TEMPLATE = (ROOT / _CFG["icon_template"]).resolve()
+
+
+def load_bgr(path: str) -> np.ndarray:
+    """用 PIL 读图（支持中文路径），返回 BGR ndarray。"""
+    a = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+    return cv2.cvtColor(a, cv2.COLOR_RGB2BGR)
+
+
+# 游戏内地图迷雾的颜色（BGR 顺序）。RGB(37,47,58) -> BGR(58,47,37)
+FOG_BGR = np.array([58, 47, 37], dtype=np.int16)
+
+
+def detect_fog_panel(bgr_screen: np.ndarray, tol: int = 24, use_fixed: bool = True):
+    """检测地图迷雾面板，返回 (x0, y0, w, h)。
+
+    use_fixed=True(默认)：直接用固定面板，最稳。
+    use_fixed=False：动态检测最大迷雾连通块（探明多时不可靠）。
+    """
+    if use_fixed:
+        return FIXED_PANEL
+    a = bgr_screen.astype(np.int16)
+    d = np.abs(a - FOG_BGR).sum(axis=2)
+    mask = (d < tol).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if num < 2:
+        return None
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x, y, w, h, area = stats[largest]
+    if area < 2000:
+        return None
+    return (int(x), int(y), int(w), int(h))
+
+
+def content_bbox(bgr_img: np.ndarray, thresh: int = 60) -> tuple[int, int, int, int]:
+    """参考图里内容(迷宫)的包围盒，裁掉四周留白/边框。返回 (x0, y0, w, h)。"""
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+    ys, xs = np.where(th > 0)
+    if len(xs) == 0:
+        return (0, 0, bgr_img.shape[1], bgr_img.shape[0])
+    return (int(xs.min()), int(ys.min()), int(xs.max() - xs.min()), int(ys.max() - ys.min()))
+
+
+def classify_region(region):
+    """按 R-B 冷暖度 + 亮度分类。0=黑/无,1=墙,2=房间(暖/棕),3=通路(冷/蓝灰),4=迷雾(中性灰)。
+
+    颜色标定（来自用户标注参考图）:
+      通路 RGB(76,82,100) R-B~-24  冷
+      房间 RGB(109,96,87) R-B~+22  暖
+      迷雾 RGB(70,70,76)  R-B~-6   中性
+      黑   RGB(28,36,46)  亮度36   暗
+    """
+    b = region[:, :, 0].astype(np.int16)
+    r = region[:, :, 2].astype(np.int16)
+    gray = 0.114 * b + 0.587 * region[:, :, 1].astype(np.int16) + 0.299 * r
+    warmth = r - b
+
+    cls = np.zeros(region.shape[:2], dtype=np.uint8)
+    dark = gray < 42   # 真正的黑/空；雾(亮度45+)不算黑
+    cls[dark] = 0
+    room = (~dark) & (warmth > 12)
+    cls[room] = 2
+    passage = (~dark) & (warmth < -10)
+    cls[passage] = 3
+    fog = (~dark) & (np.abs(warmth) <= 12) & (gray < 85)
+    cls[fog] = 4
+    cls[(~dark) & (cls == 0) & (gray >= 85)] = 1
+    return cls
+
+
+def classify_map(bgr):
+    """兼容旧名，直接用 R-B 分类。"""
+    return classify_region(bgr)
+
+
+def _find_icon(bgr, px, py, pw, ph, scales=(0.5, 0.65, 0.85, 1.0, 1.3, 1.7, 2.2)):
+    """在面板内找白色箭头入口图标（排除黄色玩家图标）。多尺度，能抓到随地图缩放缩小的图标。
+
+    返回 (中心坐标, 分数) 或 (None, 分)。
+    """
+    icon_path = ICON_TEMPLATE
+    if not icon_path.exists():
+        return None, 0  # 缺图标模板不检测（新结构由 assets/_icon_entrance.png 提供；旧版自动从硬编码截图创建的逻辑已删）
+    icon = cv2.imread(str(icon_path), cv2.IMREAD_GRAYSCALE)
+    if icon is None:
+        return None, 0
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    panel_gray = gray[py:py + ph, px:px + pw]
+    region = bgr[py:py + ph, px:px + pw]
+    rr = region[:, :, 2].astype(np.int16)
+    bb = region[:, :, 0].astype(np.int16)
+    yellow = ((rr - bb) > 50)
+    yh, yw = panel_gray.shape[0], panel_gray.shape[1]
+
+    iw, ih = icon.shape[1], icon.shape[0]
+    best_score, best_pos = 0.0, None
+    for scale in scales:
+        siw, sih = max(8, int(iw * scale)), max(8, int(ih * scale))
+        if siw > pw or sih > ph:
+            continue
+        icon_s = cv2.resize(icon, (siw, sih), interpolation=cv2.INTER_AREA)
+        res = cv2.matchTemplate(panel_gray, icon_s, cv2.TM_CCOEFF_NORMED).copy()
+        rh, rw = res.shape
+        for _ in range(6):
+            _, mv, _, ml = cv2.minMaxLoc(res)
+            if mv < 0.58:
+                break
+            mx, my = ml
+            ccx, ccy = mx + siw // 2, my + sih // 2
+            cy0, cy1 = max(0, ccy - 10), min(rh, ccy + 10)
+            cx0, cx1 = max(0, ccx - 10), min(rw, ccx + 10)
+            if yellow[cy0:cy1, cx0:cx1].size and yellow[cy0:cy1, cx0:cx1].mean() > 0.5:
+                res[max(0, my - 3):my + 3, max(0, mx - 3):mx + 3] = -1
+                continue
+            if mv > best_score:
+                best_score, best_pos = mv, (px + mx + siw // 2, py + my + sih // 2)
+            break
+    if best_pos is None or best_score < 0.58:
+        return None, best_score
+    return best_pos, best_score
+
+
+def map_is_open(shot_bgr, panel=FIXED_PANEL, icon_template=None):
+    """地图是否打开：面板里须有「迷宫内容」（迷雾 或 通路/房间/墙 结构），而非一般游戏画面。
+
+    大厅/游戏场景/结算界面 没有迷宫结构，应判为未打开。
+    返回 (bool, 迷宫内容占比)。
+    """
+    px, py, pw, ph = panel
+    region = shot_bgr[py:py + ph, px:px + pw]
+    cls = classify_region(region)
+    fog = (cls == 4)
+    structure = ((cls == 1) | (cls == 2) | (cls == 3))
+    # 迷宫内容 = 迷雾 或 通路/房间/墙 结构（暗背景不算）
+    content = ((fog | structure)).astype(np.float32).mean()
+    return content > 0.12, content

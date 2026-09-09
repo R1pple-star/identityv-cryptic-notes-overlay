@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时产物
+captures/
+校准输出/
+图标检测检查/
+experiments/
+
+# 一次性诊断脚本的可再生视觉产物
+_cmp_*.png
+_zoom_*.png
+preview_*.png
+
+# venv
+.venv/
+venv/

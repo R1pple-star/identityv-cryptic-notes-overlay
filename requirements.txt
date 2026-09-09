@@ -1,0 +1,10 @@
+# 加页手记 · 摸金地图叠层工具
+# Python 3.13（实测 3.13.15；tomllib 为 3.11+ 标准库，无需单独装）
+# 实测通过的版本组合：opencv-python-headless 5.0.0.93 / numpy 2.5.2 /
+#   Pillow 12.3.0 / PySide6 6.11.2 / mss 10.2.0 / pywin32 312
+opencv-python-headless>=5.0.0
+numpy>=2.5.0
+Pillow>=12.3.0
+PySide6>=6.11.0
+mss>=10.2.0
+pywin32>=312
