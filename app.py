@@ -490,12 +490,16 @@ class MainWindow(QWidget):
         self.preview.show()
 
     def _show_centered(self, ref):
-        h, w = self._screen_size()
+        sw, sh = self._screen_size()  # _screen_size 返回 (width, height)
         rgba, (ox, oy) = auto_align_overlay(ref, FIXED_PANEL, rotate=0)
-        full = np.zeros((h, w, 4), dtype=np.uint8)
         rh, rw = rgba.shape[:2]
         x0, y0 = max(0, ox), max(0, oy)
-        x1, y1 = min(w, ox + rw), min(h, oy + rh)
+        x1, y1 = min(sw, ox + rw), min(sh, oy + rh)
+        if x1 <= x0 or y1 <= y0:
+            # 地图超出屏幕(屏幕非1920x1080/缩放/面板坐标不符)：直接显示不贴位
+            self._show_overlay(rgba)
+            return
+        full = np.zeros((sh, sw, 4), dtype=np.uint8)  # (height, width, 4)
         full[y0:y1, x0:x1] = rgba[y0 - oy:y1 - oy, x0 - ox:x1 - ox]
         self._show_overlay(full)
 
@@ -618,6 +622,8 @@ def main():
         hotkeys.register(vk, win._entrance_pipeline, mods)
         win.set_led(True, f"已启动 · {settings.hotkey} 已注册")
         win._log_step(f"热键已注册: {settings.hotkey}", "OK")
+        sw, sh = win._screen_size()
+        win._log_step(f"屏幕 {sw}x{sh} 面板 {tuple(FIXED_PANEL)}（仅 1920x1080 精确）", "INFO")
         win._log_step("就绪：先按 g 打开游戏地图、刚进入口(图标在视野)，再 "
                       + settings.hotkey, "INFO")
     except Exception as e:  # noqa: BLE001
