@@ -11,7 +11,7 @@ captures        = "captures"                       # 运行时截图 + log.csv�
 eval_inbox      = "eval/inbox"                      # 用户手动纠正的失败样本回收
 
 [panel]
-# 固定面板坐标，仅 1920x1080 有效（多分辨率 = TODO，现在不做）
+# 固定面板坐标（1920×1080 兜底/初值）；多分辨率由 detect_fog_panel 动态检测（待做，见 UI与流程改造计划.md 阶段C）
 resolution = [1920, 1080]
 rect = [668, 166, 1064, 569]   # x, y, w, h
 
