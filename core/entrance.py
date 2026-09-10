@@ -48,17 +48,19 @@ def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18):
 
 def find_seed_by_entrance(shot, lib, entrance_type: str,
                           index_dir=ENTRANCE_INDEX_DIR, panel=FIXED_PANEL,
-                          top_n=6):
+                          top_n=6, sample_crop=None):
     """入口引索匹配。返回 ([(score, seed, 方向-门, 楼层, s, mloc), ...], icon_pos, icon_score)。
 
     score 越小越匹配。entrance_type ∈ {正门, 侧门, 二楼}。
     s 为获胜尺度(SCALES_ENT)，mloc=(mlx,mly) 为该尺度下 matchTemplate 在参考裁图里的
     argmin 位置；二者供 build_entrance_transform 构造两段式对齐第一段 M1。缺时为 None。
+    sample_crop: 手动框选的入口样本(HxWx3 BGR)，阶段3 手框纠错用；给了则用它做
+    in_cls/in_mask(跳过 _crop_around_icon)，None 则自动以图标为中心裁。默认 None=基线。
     """
     icon_pos, icon_score = _find_icon(shot, *panel)
-    if icon_pos is None:
+    if icon_pos is None and sample_crop is None:
         return [], None, 0.0
-    in_crop = _crop_around_icon(shot, panel, icon_pos)
+    in_crop = sample_crop if sample_crop is not None else _crop_around_icon(shot, panel, icon_pos)
     in_cls = classify_region(in_crop)
     in_fog = (np.abs(in_crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
     in_mask = (((in_cls == 1) | (in_cls == 2) | (in_cls == 3)) & (~in_fog)).astype(np.uint8)

@@ -22,23 +22,26 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QLabel, QMessageBox, QPlainTextEdit,
-    QPushButton, QSlider, QVBoxLayout, QWidget,
+    QPushButton, QRubberBand, QSlider, QVBoxLayout, QWidget,
 )
 
 from core.alignment import (
     affine_from_points, auto_align_overlay, find_overlay_transform, map_to_overlay_rgba,
 )
-from core.entrance import build_entrance_transform, find_seed_by_entrance, load_index
+from core.entrance import (
+    _crop_around_icon, build_entrance_transform, find_seed_by_entrance, load_index,
+)
 from core.map_library import MapLibrary
 from core.vision import FIXED_PANEL, detect_fog_panel, load_bgr
 from ui.capture import capture_monitor
 from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
+from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
 
 ROOT = Path(__file__).resolve().parent
@@ -56,18 +59,29 @@ ENTRANCE_TYPES = ("侧门", "二楼", "正门")
 
 
 class ClickPicker(QDialog):
-    """在图上点 N 个点。显示图缩放到窗口，点击坐标映射回原图。返回 [(x,y)...] 或 []。"""
+    """在图上点 N 个点 或 拖一个矩形（原图坐标）。
 
-    def __init__(self, bgr, n: int, title: str, parent=None):
+    mode='point'(默认): 点 n 个点，self.pts=[(x,y)...]。
+    mode='rect': 拖一个矩形，self.rect=(x0,y0,x1,y1)（原图坐标，含起止）。
+    """
+
+    def __init__(self, bgr, n: int, title: str, parent=None, mode: str = "point"):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.n = n
+        self.mode = mode
         self.pts: list[tuple[int, int]] = []
+        self.rect: tuple[int, int, int, int] | None = None
         self._scale = 1.0
+        self._origin = None  # rect 起点（窗坐标）
         self._label = QLabel(self)
         self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        lay = QVBoxLayout(self); lay.addWidget(self._label)
+        self._label.setStyleSheet("background:#111;")
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._label)
+        self._rubber = (QRubberBand(QRubberBand.Shape.Rectangle, self)
+                        if mode == "rect" else None)
         self._set_image(bgr)
 
     def _set_image(self, bgr):
@@ -85,11 +99,39 @@ class ClickPicker(QDialog):
         if e.button() != Qt.MouseButton.LeftButton:
             return
         p = e.position().toPoint()
+        if self.mode == "rect":
+            self._origin = p
+            self._rubber.setGeometry(p.x(), p.y(), 0, 0)
+            self._rubber.show()
+            return
         x, y = int(p.x() / self._scale), int(p.y() / self._scale)
         self.pts.append((x, y))
         self._label.setText(f"已点 {len(self.pts)}/{self.n}：{self.pts}")
         if len(self.pts) >= self.n:
             self.accept()
+
+    def mouseMoveEvent(self, e):
+        if self.mode == "rect" and self._origin is not None:
+            p = e.position().toPoint()
+            x0, y0 = min(self._origin.x(), p.x()), min(self._origin.y(), p.y())
+            w, h = abs(p.x() - self._origin.x()), abs(p.y() - self._origin.y())
+            self._rubber.setGeometry(x0, y0, w, h)
+
+    def mouseReleaseEvent(self, e):
+        if self.mode == "rect" and self._origin is not None:
+            p = e.position().toPoint()
+            x0, y0 = min(self._origin.x(), p.x()), min(self._origin.y(), p.y())
+            x1, y1 = max(self._origin.x(), p.x()), max(self._origin.y(), p.y())
+            self._origin = None
+            rx0, ry0 = int(x0 / self._scale), int(y0 / self._scale)
+            rx1, ry1 = int(x1 / self._scale), int(y1 / self._scale)
+            if (rx1 - rx0) > 10 and (ry1 - ry0) > 10:
+                self.rect = (rx0, ry0, rx1, ry1)
+                self._label.setText(f"已框: {self.rect}（确认中）")
+                self.accept()
+            else:
+                self._rubber.hide()
+                self._label.setText("框太小，重拖")
 
 
 class MainWindow(QWidget):
@@ -100,6 +142,7 @@ class MainWindow(QWidget):
         self._shot = None           # 最近捕获的屏幕 BGR
         self._seed = None           # 当前选定种子（方向+门解析）
         self.overlay: MapOverlay | None = None
+        self.preview: SamplePreview | None = None  # 入口样本预览窗（阶段3）
         self._last_shot_path = None  # 最近截图保存路径（log/回收用）
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
@@ -131,6 +174,7 @@ class MainWindow(QWidget):
 
         self.btn_realign = QPushButton("↻ 重新对齐(当前门)")
         self.btn_calib = QPushButton("✋ 3点标定(手动兜底)")
+        self.btn_picksample = QPushButton("✂ 手框样本纠错")
         self.btn_mark_wrong = QPushButton("✗ 标记上次错→回收")
         self.btn_hide = QPushButton("👁 隐藏地图")
         self.btn_settings = QPushButton("⚙ 设置")
@@ -138,6 +182,7 @@ class MainWindow(QWidget):
         self.btn_quit = QPushButton("✕ 退出")
         self.btn_realign.clicked.connect(self._realign)
         self.btn_calib.clicked.connect(self._three_point_calib)
+        self.btn_picksample.clicked.connect(self._manual_sample_pick)
         self.btn_mark_wrong.clicked.connect(self._mark_wrong)
         self.btn_hide.clicked.connect(self._hide_overlay)
         self.btn_settings.clicked.connect(self._open_settings)
@@ -160,6 +205,7 @@ class MainWindow(QWidget):
         root.addWidget(QLabel("Ctrl+Shift+F = 入口匹配+对齐"))
         root.addWidget(self.btn_realign)
         root.addWidget(self.btn_calib)
+        root.addWidget(self.btn_picksample)
         root.addWidget(self.btn_mark_wrong)
         root.addWidget(self.btn_hide)
         root.addWidget(self.btn_settings)
@@ -265,19 +311,24 @@ class MainWindow(QWidget):
         et = self.entrance_combo.currentText()
         res, icon_pos, isc = find_seed_by_entrance(shot, self.lib, et, top_n=3)
         if icon_pos is None:
-            self._log_step(f"入口图标未检出(分{isc:.2f}) → 手动选门/3点标定/手框样本", "WARN")
+            self._log_step(f"入口图标未检出(分{isc:.2f}) → 手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f}")
+        sample = _crop_around_icon(shot, FIXED_PANEL, icon_pos, self.settings.sample_half_frac)
+        self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
         if not res:
-            self._log_step("入口匹配无结果 → 手动选门/3点标定/手框样本", "WARN")
+            self._log_step("入口匹配无结果 → 手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         best = res[0]
-        sc, seed, key, fl, _s, _mloc = best
-        self._log_step(f"入口匹配: 种子{seed}({key}[{fl}]) 分{sc:.3f} top3="
+        self._log_step(f"入口匹配: 种子{best[1]}({best[2]}[{best[3]}]) 分{best[0]:.3f} top3="
                        + str([(r[1], round(r[0], 3)) for r in res[:3]]), "OK")
-        # 填 UI（种子/方向/门/楼层）
+        self._after_match(shot, best, et, icon_pos, isc, res, corrected=False)
+
+    def _after_match(self, shot, best, et, icon_pos, isc, res, corrected=False):
+        """拿到 best 后：填 UI + 两段式对齐 + 投影 + 归档。供热键/手框样本复用。"""
+        sc, seed, key, fl, _s, _mloc = best
         self.floor_combo.blockSignals(True); self.floor_combo.setCurrentText(fl)
         self.floor_combo.blockSignals(False)
         bdir, door = key.split("-", 1)
@@ -310,7 +361,7 @@ class MainWindow(QWidget):
             self._log_step("对齐失败(探明不足)，居中显示", "WARN")
 
         confident = (sc < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
-        self._log(et, res, icon_pos, isc, align, corrected=False)
+        self._log(et, res, icon_pos, isc, align, corrected=corrected)
         ov_txt = f"{ov:.2f}" if ov is not None else "-"
         self.status.setText(
             f"入口{et}(图标{isc:.2f}) 入口分{sc:.3f} 重叠{ov_txt} → 种子{seed}({key}[{fl}])"
@@ -389,9 +440,31 @@ class MainWindow(QWidget):
         M = affine_from_points(pk2.pts, pk1.pts)  # src=ref, dst=screen
         if M is None:
             self.status.setText("3点标定失败（点不足）"); return
-        rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size())
+        rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
         self._show_overlay(rgba)
         self.status.setText(f"3点标定投影：{info.key}")
+
+    def _manual_sample_pick(self):
+        """手动框选入口样本：在最近截图上拖矩形，作为 sample 重跑匹配（纠错）。"""
+        if self._shot is None and not self._capture():
+            return
+        pk = ClickPicker(self._shot, 1, "拖框选入口样本区域", parent=self, mode="rect")
+        if not pk.exec() or not pk.rect:
+            self._log_step("手框取消", "INFO"); return
+        x0, y0, x1, y1 = pk.rect
+        sample = self._shot[y0:y1, x0:x1].copy()
+        self._show_sample_preview(sample)
+        et = self.entrance_combo.currentText()
+        self._log_step(f"手框样本 {x1-x0}x{y1-y0}，重跑匹配", "INFO")
+        res, icon_pos, isc = find_seed_by_entrance(
+            self._shot, self.lib, et, top_n=3, sample_crop=sample)
+        if not res:
+            self._log_step("手框样本仍无匹配 → 检查框选或用3点标定", "WARN")
+            self._log(et, res, icon_pos, isc, None, corrected=True)
+            return
+        best = res[0]
+        self._log_step(f"手框匹配: 种子{best[1]}({best[2]}[{best[3]}]) 分{best[0]:.3f}", "OK")
+        self._after_match(self._shot, best, et, icon_pos, isc, res, corrected=True)
 
     # ---- 投影显示 ----
     def _screen_size(self):
@@ -400,10 +473,21 @@ class MainWindow(QWidget):
 
     def _show_overlay(self, rgba):
         if self.overlay is None:
-            self.overlay = MapOverlay(QApplication.primaryScreen().geometry())
+            screen = QApplication.primaryScreen()
+            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
+            self.overlay = MapOverlay(geo)
         self.overlay.set_image(rgba)
         self.overlay.setWindowOpacity(self.opacity_slider.value() / 100.0)
         self.overlay.show()
+
+    def _show_sample_preview(self, bgr):
+        """显示匹配用的入口样本（让玩家看到选对没），贴主窗右侧。"""
+        if self.preview is None:
+            self.preview = SamplePreview()
+            g = self.geometry()
+            self.preview.move(g.right() + 8, g.top())
+        self.preview.set_sample(bgr)
+        self.preview.show()
 
     def _show_centered(self, ref):
         h, w = self._screen_size()
@@ -510,6 +594,8 @@ class MainWindow(QWidget):
     def _quit(self):
         if self.overlay is not None:
             self.overlay.close()
+        if self.preview is not None:
+            self.preview.close()
         hk = getattr(self, "_hotkeys", None)
         if hk is not None:
             try:
