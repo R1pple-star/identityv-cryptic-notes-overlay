@@ -1,0 +1,7 @@
+{
+  "overlay_opacity": 0.7,
+  "wall_alpha": 160,
+  "hotkey": "Ctrl+Shift+F",
+  "show_log": true,
+  "sample_half_frac": 0.18
+}

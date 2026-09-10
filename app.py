@@ -36,9 +36,10 @@ from core.entrance import build_entrance_transform, find_seed_by_entrance, load_
 from core.map_library import MapLibrary
 from core.vision import FIXED_PANEL, detect_fog_panel, load_bgr
 from ui.capture import capture_monitor
-from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager
+from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
+from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
 
 ROOT = Path(__file__).resolve().parent
 with open(ROOT / "config.toml", "rb") as _f:
@@ -92,9 +93,10 @@ class ClickPicker(QDialog):
 
 
 class MainWindow(QWidget):
-    def __init__(self, lib: MapLibrary):
+    def __init__(self, lib: MapLibrary, settings: Settings | None = None):
         super().__init__()
         self.lib = lib
+        self.settings = settings if settings is not None else load_settings()
         self._shot = None           # 最近捕获的屏幕 BGR
         self._seed = None           # 当前选定种子（方向+门解析）
         self.overlay: MapOverlay | None = None
@@ -117,6 +119,7 @@ class MainWindow(QWidget):
         self.log_view.setMaximumBlockCount(300)
         self.log_view.setFixedHeight(150)
         self.log_view.setStyleSheet("background:#1a1a1a; color:#ccc; font-size:11px;")
+        self.log_view.setVisible(self.settings.show_log)
 
         self.direction_combo = QComboBox(); self.direction_combo.addItems(lib.directions())
         self.door_combo = QComboBox()
@@ -130,17 +133,20 @@ class MainWindow(QWidget):
         self.btn_calib = QPushButton("✋ 3点标定(手动兜底)")
         self.btn_mark_wrong = QPushButton("✗ 标记上次错→回收")
         self.btn_hide = QPushButton("👁 隐藏地图")
+        self.btn_settings = QPushButton("⚙ 设置")
         self.btn_manage = QPushButton("🗂 素材管理")
         self.btn_quit = QPushButton("✕ 退出")
         self.btn_realign.clicked.connect(self._realign)
         self.btn_calib.clicked.connect(self._three_point_calib)
         self.btn_mark_wrong.clicked.connect(self._mark_wrong)
         self.btn_hide.clicked.connect(self._hide_overlay)
+        self.btn_settings.clicked.connect(self._open_settings)
         self.btn_manage.clicked.connect(self._manage_materials)
         self.btn_quit.clicked.connect(self._quit)
 
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
-        self.opacity_slider.setRange(20, 100); self.opacity_slider.setValue(70)
+        self.opacity_slider.setRange(20, 100)
+        self.opacity_slider.setValue(int(self.settings.overlay_opacity * 100))
         self.opacity_slider.valueChanged.connect(self._set_opacity)
 
         root = QVBoxLayout(); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(5)
@@ -156,6 +162,7 @@ class MainWindow(QWidget):
         root.addWidget(self.btn_calib)
         root.addWidget(self.btn_mark_wrong)
         root.addWidget(self.btn_hide)
+        root.addWidget(self.btn_settings)
         root.addWidget(self.btn_manage)
         root.addWidget(self.btn_quit)
         root.addWidget(QLabel("地图透明度")); root.addWidget(self.opacity_slider)
@@ -291,7 +298,7 @@ class MainWindow(QWidget):
             if show_ok:
                 info = self.lib.get(seed, fl)
                 if info is not None:
-                    rgba = map_to_overlay_rgba(str(info.path), align[0], *self._screen_size())
+                    rgba = map_to_overlay_rgba(str(info.path), align[0], *self._screen_size(), wall_alpha=self.settings.wall_alpha)
                     self._show_overlay(rgba)
                     self._log_step("投影已显示", "OK")
                 else:
@@ -355,7 +362,7 @@ class MainWindow(QWidget):
             self.status.setText("对齐失败：探明不足"); return
         M, asc, ov = align
         if asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN:
-            rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size())
+            rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
             self._show_overlay(rgba)
             self.status.setText(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
         else:
@@ -465,6 +472,32 @@ class MainWindow(QWidget):
         except Exception as e:  # noqa: BLE001
             self.status.setText(f"回收失败: {e}")
 
+    # ---- 设置（阶段2）----
+    def _open_settings(self):
+        dlg = SettingsDialog(self.settings, parent=self)
+        if dlg.exec() and dlg.result_settings is not None:
+            self.settings = dlg.result_settings
+            save_settings(self.settings)
+            self._apply_settings()
+
+    def _apply_settings(self):
+        """应用当前 settings：透明度/日志/墙体 alpha 即时；热键重注册。"""
+        self.log_view.setVisible(self.settings.show_log)
+        self.opacity_slider.setValue(int(self.settings.overlay_opacity * 100))
+        self._set_opacity(self.opacity_slider.value())
+        # wall_alpha 下次投影生效（map_to_overlay_rgba 读 self.settings.wall_alpha）
+        hk = getattr(self, "_hotkeys", None)
+        if hk is not None:
+            try:
+                hk.unregister_all()
+                vk, mods = parse_hotkey(self.settings.hotkey)
+                hk.register(vk, self._entrance_pipeline, mods)
+                self.set_led(True, f"已启动 · {self.settings.hotkey} 已注册")
+                self._log_step(f"热键已改为: {self.settings.hotkey}", "OK")
+            except Exception as e:  # noqa: BLE001
+                self.set_led(False, "热键失败")
+                self._log_step(f"热键重注册失败: {e}（改回设置或重启）", "ERROR")
+
     # ---- 素材管理 / 退出 ----
     def _manage_materials(self):
         dlg = ManageMaterialsDialog(str(self.lib.base_dir), on_change=self._reload_lib, parent=self)
@@ -488,21 +521,24 @@ class MainWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    settings = load_settings()
     lib = MapLibrary.load(MAP_DIR)
-    win = MainWindow(lib)
+    win = MainWindow(lib, settings)
     win.show()
 
     hotkeys = HotkeyManager()
     try:
-        hotkeys.register(ord("F"), win._entrance_pipeline, MOD_CONTROL | MOD_SHIFT)
-        win.set_led(True, "已启动 · Ctrl+Shift+F 已注册")
-        win._log_step("热键已注册: Ctrl+Shift+F", "OK")
-        win._log_step("就绪：先按 g 打开游戏地图、刚进入口(图标在视野)，再 Ctrl+Shift+F", "INFO")
+        vk, mods = parse_hotkey(settings.hotkey)
+        hotkeys.register(vk, win._entrance_pipeline, mods)
+        win.set_led(True, f"已启动 · {settings.hotkey} 已注册")
+        win._log_step(f"热键已注册: {settings.hotkey}", "OK")
+        win._log_step("就绪：先按 g 打开游戏地图、刚进入口(图标在视野)，再 "
+                      + settings.hotkey, "INFO")
     except Exception as e:  # noqa: BLE001
         win.set_led(False, "热键失败")
         win._log_step(f"热键注册失败: {e}（手动选门/3点标定仍可用）", "ERROR")
         QMessageBox.warning(win, "热键注册失败",
-            f"{e}\n\n手动选门 + 3 点标定仍可用。\n（自定义热键见后续设置面板）")
+            f"{e}\n\n手动选门 + 3 点标定仍可用。\n（可在「设置」改热键）")
     win._hotkeys = hotkeys  # 保引用
 
     sys.exit(app.exec())

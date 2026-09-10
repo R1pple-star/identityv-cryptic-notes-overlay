@@ -121,6 +121,58 @@ class HotkeyManager:
         self._ids.clear()
 
 
+# ---- 热键串 <-> (vk, mods) 解析（供 settings 持久化用）----
+_MOD_TOKENS = {
+    "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
+    "shift": MOD_SHIFT,
+    "alt": MOD_ALT,
+    "win": MOD_WIN,
+}
+
+
+def parse_hotkey(s: str) -> tuple[int, int]:
+    """'Ctrl+Shift+F' -> (vk, mods)。最后一段为主键（单字符 ord 或 VK_ 名）。"""
+    import win32con
+    parts = [p.strip() for p in s.replace("|", "+").split("+") if p.strip()]
+    mods = 0
+    key = None
+    for p in parts:
+        lo = p.lower()
+        if lo in _MOD_TOKENS:
+            mods |= _MOD_TOKENS[lo]
+        else:
+            key = p
+    if key is None:
+        raise ValueError(f"热键串缺主键: {s!r}")
+    k = key.upper()
+    vk = getattr(win32con, "VK_" + k, None)
+    if vk is None and len(key) == 1 and key.isalnum():
+        vk = ord(key.upper())
+    if vk is None:
+        raise ValueError(f"无法解析主键: {key!r}（用 F/F8/Space 等）")
+    return int(vk), int(mods)
+
+
+def format_hotkey(vk: int, mods: int) -> str:
+    """(vk, mods) -> 'Ctrl+Shift+F'。"""
+    import win32con
+    names = []
+    for tok, m in (("Ctrl", MOD_CONTROL), ("Shift", MOD_SHIFT),
+                   ("Alt", MOD_ALT), ("Win", MOD_WIN)):
+        if mods & m:
+            names.append(tok)
+    keyname = None
+    for name in dir(win32con):
+        if name.startswith("VK_") and getattr(win32con, name) == vk:
+            keyname = name[3:]
+            break
+    if keyname is None and 0x30 <= vk <= 0x5A:  # 0-9 / A-Z
+        keyname = chr(vk)
+    if keyname is None:
+        keyname = f"vk{vk}"
+    return "+".join(names + [keyname])
+
+
 if __name__ == "__main__":
     # 自检：注册 F8，打印说明（不实际触发）
     import win32con
