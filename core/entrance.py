@@ -35,14 +35,21 @@ SCALES_ENT = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4)
 
 
 def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18):
-    """以入口图标为中心，裁面板 min 维的 half_frac*2 宽的方区域。"""
+    """以入口图标为中心，裁面板 min 维的 half_frac*2 宽的方区域。
+
+    图标贴面板边缘时，方框整体 clamp 入面板（保持完整 2*half 宽，不截断成窄条），
+    避免样本退化致匹配 0.000。icon 在面板中央时与旧 max/min 裁法结果一致（基线不变）。
+    """
     px, py, pw, ph = panel
     cx, cy = icon_pos
     cxp, cyp = cx - px, cy - py
     half = int(min(pw, ph) * half_frac)
     region = shot[py:py + ph, px:px + pw]
-    x0, x1 = max(0, cxp - half), min(pw, cxp + half)
-    y0, y1 = max(0, cyp - half), min(ph, cyp + half)
+    side = 2 * half
+    x0 = min(max(cxp - half, 0), max(0, pw - side))
+    x1 = x0 + side
+    y0 = min(max(cyp - half, 0), max(0, ph - side))
+    y1 = y0 + side
     return region[y0:y1, x0:x1].copy()
 
 

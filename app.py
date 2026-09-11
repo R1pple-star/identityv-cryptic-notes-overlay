@@ -363,6 +363,11 @@ class MainWindow(QWidget):
     def _after_match(self, shot, best, et, icon_pos, isc, res, corrected=False):
         """拿到 best 后：填 UI + 两段式对齐 + 投影 + 归档。供热键/手框样本复用。"""
         sc, seed, key, fl, _s, _mloc = best
+        # 退化防御：top1 与 top2 分差<0.001（多种子同分0.000）→ 样本退化/图标假阳，不假阳报告
+        if len(res) >= 2 and sc < 0.001 and (res[1][0] - sc) < 0.001:
+            self._log_step(f"匹配退化(多种子同分 {sc:.3f}) → 图标可能假阳/贴边，请手框样本或3点标定", "WARN")
+            self._log(et, res, icon_pos, isc, None, corrected=corrected)
+            return
         self.floor_combo.blockSignals(True); self.floor_combo.setCurrentText(fl)
         self.floor_combo.blockSignals(False)
         bdir, door = key.split("-", 1)
