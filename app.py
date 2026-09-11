@@ -23,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QRect
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QLabel, QMessageBox, QPlainTextEdit,
     QPushButton, QRubberBand, QSlider, QVBoxLayout, QWidget,
@@ -63,6 +63,7 @@ class ClickPicker(QDialog):
 
     mode='point'(默认): 点 n 个点，self.pts=[(x,y)...]。
     mode='rect': 拖一个矩形，self.rect=(x0,y0,x1,y1)（原图坐标，含起止）。
+    点/框画在 pixmap 副本上，进度文本走独立 _status（不 setText 图 label，避免清 pixmap 黑屏）。
     """
 
     def __init__(self, bgr, n: int, title: str, parent=None, mode: str = "point"):
@@ -78,10 +79,13 @@ class ClickPicker(QDialog):
         self._label = QLabel(self)
         self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self._label.setStyleSheet("background:#111;")
-        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._label)
+        self._status = QLabel(self)  # 进度文本独立 label，不碰图 label
+        self._status.setStyleSheet("color:#ffcc66; padding:4px; background:#222;")
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+        lay.addWidget(self._label); lay.addWidget(self._status)
         self._rubber = (QRubberBand(QRubberBand.Shape.Rectangle, self)
                         if mode == "rect" else None)
+        self._orig_pix = None
         self._set_image(bgr)
 
     def _set_image(self, bgr):
@@ -91,9 +95,24 @@ class ClickPicker(QDialog):
         dw, dh = int(w * self._scale), int(h * self._scale)
         small = cv2.resize(bgr, (dw, dh), interpolation=cv2.INTER_AREA)
         qimg = QImage(small.tobytes(), dw, dh, 3 * dw, QImage.Format.Format_RGB888).rgbSwapped()
-        self._label.setPixmap(QPixmap.fromImage(qimg))
+        self._orig_pix = QPixmap.fromImage(qimg)
+        self._label.setPixmap(self._orig_pix)
         self._label.setFixedSize(dw, dh)
+        self._status.setText("点 %d 个点（顺序自定）" % self.n if self.mode == "point"
+                             else "拖框选一个矩形区域")
         self.adjustSize()
+
+    def _draw_points(self):
+        if self._orig_pix is None:
+            return
+        pix = self._orig_pix.copy()
+        painter = QPainter(pix)
+        pen = QPen(QColor(255, 255, 0)); pen.setWidth(3); painter.setPen(pen)
+        for (x, y) in self.pts:
+            px, py = int(x * self._scale), int(y * self._scale)
+            painter.drawEllipse(px - 6, py - 6, 12, 12)
+        painter.end()
+        self._label.setPixmap(pix)
 
     def mousePressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
@@ -106,7 +125,8 @@ class ClickPicker(QDialog):
             return
         x, y = int(p.x() / self._scale), int(p.y() / self._scale)
         self.pts.append((x, y))
-        self._label.setText(f"已点 {len(self.pts)}/{self.n}：{self.pts}")
+        self._draw_points()
+        self._status.setText(f"已点 {len(self.pts)}/{self.n}：{self.pts}")
         if len(self.pts) >= self.n:
             self.accept()
 
@@ -127,11 +147,11 @@ class ClickPicker(QDialog):
             rx1, ry1 = int(x1 / self._scale), int(y1 / self._scale)
             if (rx1 - rx0) > 10 and (ry1 - ry0) > 10:
                 self.rect = (rx0, ry0, rx1, ry1)
-                self._label.setText(f"已框: {self.rect}（确认中）")
+                self._status.setText(f"已框: {self.rect}（确认中）")
                 self.accept()
             else:
                 self._rubber.hide()
-                self._label.setText("框太小，重拖")
+                self._status.setText("框太小，重拖")
 
 
 class MainWindow(QWidget):
