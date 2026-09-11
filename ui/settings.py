@@ -28,7 +28,7 @@ class Settings:
     wall_alpha: int = 160             # 地图墙体 alpha（map_to_overlay_rgba 原硬编码 160）
     hotkey: str = "Ctrl+Shift+F"      # 热键串，启动时 parse 成 (vk, mods)
     show_log: bool = True             # 运行日志区显隐
-    sample_half_frac: float = 0.18    # 入口样本裁剪半边比例（阶段 3 用）
+    sample_half_frac: float = 0.18    # 入口样本裁剪半边比例（icon 贴边时内部自动增大到 0.25）
 
 
 def load() -> Settings:
