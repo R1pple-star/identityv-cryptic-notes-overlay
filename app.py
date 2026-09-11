@@ -25,8 +25,8 @@ import numpy as np
 from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QLabel, QMessageBox, QPlainTextEdit,
-    QPushButton, QRubberBand, QSlider, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox,
+    QPlainTextEdit, QPushButton, QRubberBand, QSlider, QVBoxLayout, QWidget,
 )
 
 from core.alignment import (
@@ -206,21 +206,21 @@ class MainWindow(QWidget):
         self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
         self.door_combo.currentIndexChanged.connect(self._resolve_seed)
 
-        self.btn_realign = QPushButton("↻ 重新对齐(当前门)")
-        self.btn_calib = QPushButton("✋ 3点标定(手动兜底)")
-        self.btn_picksample = QPushButton("✂ 手框样本纠错")
-        self.btn_mark_wrong = QPushButton("✗ 标记上次错→回收")
+        # ---- UI改造B1：主界面只留高频按钮；低频(素材/标记错/设置/热键状态)进「⋯选项」菜单 ----
+        self.btn_onematch = QPushButton("🔴 一键匹配（=热键）")
+        self.btn_onematch.setStyleSheet("font-weight:bold; padding:8px; background:#2a4a2a;")
+        self.btn_onematch.clicked.connect(self._entrance_pipeline)
+        self.btn_realign = QPushButton("▶ 按此种子对齐（用上面选的门）")
+        self.btn_picksample = QPushButton("✂ 手框样本匹配")
+        self.btn_calib = QPushButton("✋ 手动选点重合")
         self.btn_hide = QPushButton("👁 隐藏地图")
-        self.btn_settings = QPushButton("⚙ 设置")
-        self.btn_manage = QPushButton("🗂 素材管理")
+        self.btn_options = QPushButton("⋯ 选项")
         self.btn_quit = QPushButton("✕ 退出")
         self.btn_realign.clicked.connect(self._realign)
-        self.btn_calib.clicked.connect(self._three_point_calib)
         self.btn_picksample.clicked.connect(self._manual_sample_pick)
-        self.btn_mark_wrong.clicked.connect(self._mark_wrong)
+        self.btn_calib.clicked.connect(self._three_point_calib)
         self.btn_hide.clicked.connect(self._hide_overlay)
-        self.btn_settings.clicked.connect(self._open_settings)
-        self.btn_manage.clicked.connect(self._manage_materials)
+        self.btn_options.clicked.connect(self._show_options_menu)
         self.btn_quit.clicked.connect(self._quit)
 
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
@@ -230,21 +230,20 @@ class MainWindow(QWidget):
 
         root = QVBoxLayout(); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(5)
         root.addWidget(self.led)
+        root.addWidget(self.btn_onematch)
+        root.addWidget(QLabel("── 手动纠错（自动出错时用）──"))
         for text, widget in [("方向（入口朝向）", self.direction_combo),
                              ("门特征", self.door_combo),
                              ("楼层", self.floor_combo),
                              ("入口(引索匹配用)", self.entrance_combo)]:
             root.addWidget(QLabel(text)); root.addWidget(widget)
         root.addWidget(self.seed_label)
-        root.addWidget(QLabel("Ctrl+Shift+F = 入口匹配+对齐"))
         root.addWidget(self.btn_realign)
-        root.addWidget(self.btn_calib)
         root.addWidget(self.btn_picksample)
-        root.addWidget(self.btn_mark_wrong)
-        root.addWidget(self.btn_hide)
-        root.addWidget(self.btn_settings)
-        root.addWidget(self.btn_manage)
-        root.addWidget(self.btn_quit)
+        root.addWidget(self.btn_calib)
+        misc = QHBoxLayout()
+        misc.addWidget(self.btn_hide); misc.addWidget(self.btn_options); misc.addWidget(self.btn_quit)
+        root.addLayout(misc)
         root.addWidget(QLabel("地图透明度")); root.addWidget(self.opacity_slider)
         self.status = QLabel("就绪。Ctrl+Shift+F 入口匹配（需先按 g 打开地图、刚进入口）。")
         self.status.setStyleSheet("color:#aaa; word-wrap:break-word; font-size:11px;")
@@ -601,6 +600,24 @@ class MainWindow(QWidget):
             self.status.setText(f"已回收失败样本→ {dst.name}（待标注进 eval/labels.csv）")
         except Exception as e:  # noqa: BLE001
             self.status.setText(f"回收失败: {e}")
+
+    # ---- 选项菜单（UI改造B2：低频折叠）----
+    def _show_options_menu(self):
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addAction("🗂 素材管理", self._manage_materials)
+        menu.addAction("✗ 标记上次错→回收", self._mark_wrong)
+        menu.addAction("⚙ 设置", self._open_settings)
+        menu.addAction("ℹ 热键状态", self._show_hotkey_status)
+        menu.exec(QCursor.pos())
+
+    def _show_hotkey_status(self):
+        hk = getattr(self, "_hotkeys", None)
+        reg = hk is not None and bool(getattr(hk, "_callbacks", {}))
+        QMessageBox.information(self, "热键状态",
+            f"当前热键: {self.settings.hotkey}\n注册状态: "
+            + ("已注册" if reg else "未注册（可能被占用，去设置改键）"))
 
     # ---- 设置（阶段2）----
     def _open_settings(self):
