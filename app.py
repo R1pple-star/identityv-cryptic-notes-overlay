@@ -44,6 +44,20 @@ from ui.overlay import MapOverlay
 from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
 
+# DPI 缩放适配：让进程用物理像素（per-monitor DPI aware + Qt 禁用 high-DPI scaling），
+# 使 mss 截屏、Qt 窗口坐标、FIXED_PANEL 三者统一于物理像素。否则 125%/150% 缩放下
+# 截屏=逻辑像素而 FIXED_PANEL=物理坐标，错位致图标检偏、匹配退化(分0.000)、投影位置不对。
+import ctypes
+import os
+os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+except Exception:  # noqa: BLE001  旧 Windows 无 shcore
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        pass
+
 ROOT = Path(__file__).resolve().parent
 with open(ROOT / "config.toml", "rb") as _f:
     _CFG = tomllib.load(_f)
@@ -488,14 +502,17 @@ class MainWindow(QWidget):
 
     # ---- 投影显示 ----
     def _screen_size(self):
-        g = QApplication.primaryScreen().geometry()
-        return g.width(), g.height()
+        # 用 mss 主显示器物理尺寸（DPI aware 后=物理像素），与截屏/FIXED_PANEL 一致；
+        # 不用 Qt primaryScreen.geometry()（DPI 缩放下可能返回逻辑像素致错位）
+        import mss
+        with mss.mss() as sct:
+            m = sct.monitors[1]
+            return int(m["width"]), int(m["height"])
 
     def _show_overlay(self, rgba):
         if self.overlay is None:
-            screen = QApplication.primaryScreen()
-            geo = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
-            self.overlay = MapOverlay(geo)
+            sw, sh = self._screen_size()
+            self.overlay = MapOverlay(QRect(0, 0, sw, sh))
         self.overlay.set_image(rgba)
         self.overlay.setWindowOpacity(self.opacity_slider.value() / 100.0)
         self.overlay.show()
