@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 
 class SamplePreview(QWidget):
@@ -32,6 +32,16 @@ class SamplePreview(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._label)
         self.resize(282, 282)
+        # 关闭按钮：看过即可关（hide 不销毁，下次匹配 set_sample+show 复用）
+        self._btn_close = QPushButton("✕", self)
+        self._btn_close.setFixedSize(22, 22)
+        self._btn_close.move(282 - 26, 3)
+        self._btn_close.setToolTip("关闭预览（下次匹配自动再弹出）")
+        self._btn_close.setStyleSheet(
+            "QPushButton{background:#333;color:#aaa;border:none;font-size:12px;}"
+            "QPushButton:hover{background:#c0392b;color:#fff;}")
+        self._btn_close.clicked.connect(self.hide)
+        self._btn_close.raise_()
         self._drag = None
 
     def set_sample(self, bgr: np.ndarray | None, icon_box=None):
