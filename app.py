@@ -520,6 +520,7 @@ class MainWindow(QWidget):
         self.overlay.set_image(rgba)
         self.overlay.setWindowOpacity(self.opacity_slider.value() / 100.0)
         self.overlay.show()
+        self.btn_hide.setText("👁 隐藏地图")  # 新投影显示后按钮复位为「隐藏」
 
     def _show_sample_preview(self, bgr):
         """显示匹配用的入口样本（让玩家看到选对没），贴主窗右侧。"""
@@ -551,7 +552,14 @@ class MainWindow(QWidget):
 
     def _hide_overlay(self):
         if self.overlay is not None:
-            self.overlay.hide()
+            if self.overlay.isVisible():
+                self.overlay.hide()
+                self.btn_hide.setText("👁 显示地图")
+                self._log_step("地图已隐藏（再点一次显示）")
+            else:
+                self.overlay.show()
+                self.btn_hide.setText("👁 隐藏地图")
+                self._log_step("地图已显示")
 
     def _set_opacity(self, v):
         if self.overlay is not None:
