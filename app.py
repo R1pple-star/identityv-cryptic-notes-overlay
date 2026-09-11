@@ -33,7 +33,7 @@ from core.alignment import (
     affine_from_points, auto_align_overlay, find_overlay_transform, map_to_overlay_rgba,
 )
 from core.entrance import (
-    _crop_around_icon, build_entrance_transform, find_seed_by_entrance, load_index,
+    _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance, load_index,
 )
 from core.map_library import MapLibrary
 from core.vision import FIXED_PANEL, detect_fog_panel, load_bgr
@@ -67,6 +67,7 @@ EVAL_INBOX = ROOT / _CFG["paths"]["eval_inbox"]
 SCORE_CONFIDENT = float(_CFG["match"]["score_confident"])
 ALIGN_SCORE_MAX = float(_CFG["match"]["align_score_max"])
 OVERLAP_MIN = float(_CFG["match"]["overlap_min"])
+SAMPLE_MASK_MIN = float(_CFG["match"]["sample_mask_min"])
 
 # 入口判别力降序：侧门/二楼房间形状各异（主要判别依据）；正门固定分不出种子。
 ENTRANCE_TYPES = ("侧门", "二楼", "正门")
@@ -350,6 +351,14 @@ class MainWindow(QWidget):
         self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f}")
         sample = _crop_around_icon(shot, FIXED_PANEL, icon_pos, self.settings.sample_half_frac)
         self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
+        # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
+        # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
+        _cls, smask, _w = build_sample_mask(sample)
+        if smask.mean() < SAMPLE_MASK_MIN:
+            self._log_step(f"样本结构仅{smask.mean() * 100:.0f}%（入口周围未探明）→ "
+                           "请在刚进入口、周围已探明时再按", "WARN")
+            self._log(et, [], icon_pos, isc, None, corrected=False)
+            return
         if not res:
             self._log_step("入口匹配无结果 → 手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
