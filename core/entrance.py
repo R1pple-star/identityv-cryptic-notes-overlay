@@ -32,6 +32,11 @@ ENTRANCE_INDEX_DIR = (ROOT / _CFG["paths"]["entrance_index"]).resolve()
 ENTRANCE_FLOOR = {"正门": "一楼", "侧门": "一楼", "二楼": "二楼"}
 # 入口裁图尺度接近(都~200px)，窄范围多尺度对齐
 SCALES_ENT = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4)
+# 渐变迷雾剔除 + 房间加权（config [match]；迷雾是渐变色，仅 tol24 精确色剔不净外圈，
+# 膨胀雾核一并剔；房间亮度两侧都远离雾色、误判率最低→加权，通路易被雾污染→降权）
+_FOG_DILATE = int(_CFG["match"].get("fog_dilate", 5))
+_ROOM_W = float(_CFG["match"].get("room_weight", 2.0))
+_PASS_W = float(_CFG["match"].get("passage_weight", 0.5))
 
 
 def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18):
@@ -53,6 +58,26 @@ def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18):
     return region[y0:y1, x0:x1].copy()
 
 
+def build_sample_mask(crop):
+    """样本分类 mask：迷雾(含渐变外圈)剔除 + 房间/通路加权。
+
+    迷雾是渐变色：tol24 精确色只剔得掉雾核，渐变外圈会被 classify_region 判成
+    通路(cls3) 污染 mask——故把雾核膨胀 _FOG_DILATE px 一并剔除（渐变段与雾核
+    空间相邻）。房间(cls2)亮度两侧都远离雾色、误判率最低→权重 _ROOM_W；
+    通路(cls3)最易被渐变雾污染→降权 _PASS_W。参数见 config [match]。
+    返回 (cls, mask_u8, weights_f32)。"""
+    cls = classify_region(crop)
+    fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
+    if _FOG_DILATE > 0:
+        fog = cv2.dilate(fog.astype(np.uint8),
+                         np.ones((_FOG_DILATE, _FOG_DILATE), np.uint8)) > 0
+    mask = (((cls == 1) | (cls == 2) | (cls == 3)) & (~fog)).astype(np.uint8)
+    w = mask.astype(np.float32) * _PASS_W
+    w[cls == 2] = _ROOM_W
+    w[cls == 1] = 1.0
+    return cls, mask, w
+
+
 def find_seed_by_entrance(shot, lib, entrance_type: str,
                           index_dir=ENTRANCE_INDEX_DIR, panel=FIXED_PANEL,
                           top_n=6, sample_crop=None):
@@ -68,9 +93,7 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
     if icon_pos is None and sample_crop is None:
         return [], None, 0.0
     in_crop = sample_crop if sample_crop is not None else _crop_around_icon(shot, panel, icon_pos)
-    in_cls = classify_region(in_crop)
-    in_fog = (np.abs(in_crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
-    in_mask = (((in_cls == 1) | (in_cls == 2) | (in_cls == 3)) & (~in_fog)).astype(np.uint8)
+    in_cls, in_mask, in_w = build_sample_mask(in_crop)
     if in_mask.sum() < 100:
         return [], icon_pos, icon_score
 
@@ -89,7 +112,7 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
             if tw < 10 or th < 10 or th > idx_cls.shape[0] or tw > idx_cls.shape[1]:
                 continue
             tcl = cv2.resize(in_cls, (tw, th), interpolation=cv2.INTER_NEAREST)
-            tmk = cv2.resize(in_mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+            tmk = cv2.resize(in_w, (tw, th), interpolation=cv2.INTER_NEAREST)
             if tmk.sum() < 50:
                 continue
             res = cv2.matchTemplate(idx_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
