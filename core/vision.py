@@ -32,6 +32,9 @@ def _load_config():
         with open(_CONFIG_PATH, "rb") as f:
             cfg = tomllib.load(f)
         defaults["panel_rect"] = tuple(cfg["panel"]["rect"])
+        defaults["panel_res"] = tuple(cfg["panel"].get("resolution", [1920, 1080]))
+        defaults["panel_rects"] = {k: tuple(v)
+                                   for k, v in cfg["panel"].get("rects", {}).items()}
         defaults["icon_template"] = cfg["paths"]["icon_template"]
     except Exception:
         pass
@@ -40,8 +43,46 @@ def _load_config():
 
 _CFG = _load_config()
 
-# 地图面板在屏幕上的固定位置（1920x1080）：x, y, 宽, 高。依据用户标注参考图的地图边界白框确定。
+# 基准分辨率下的固定面板（x, y, 宽, 高）。依据用户标注参考图的地图边界白框确定。
+# 其它分辨率经 panel_for_screen 等比外推或查 config [panel.rects] 校准表。
 FIXED_PANEL = _CFG["panel_rect"]
+_PANEL_REF_RES = _CFG["panel_res"]
+
+
+def panel_for_screen(w: int, h: int):
+    """按物理分辨率求地图面板 (x, y, w, h)；未适配分辨率返回 None。
+
+    优先级：1920×1080（=基准）→ FIXED_PANEL 精确值；config [panel.rects] 每分辨率
+    校准表；同为 16:9 → 按 W/基准宽 等比外推（右/下边缘取整再回推宽高，避免独立
+    取整累计漂移）；非 16:9 且未校准 → None。
+
+    注：动态检测（雾块/暗块连通块）已实测证伪——雾态下面板边缘两侧同为深色不可见，
+    雾块 bbox 随探明状态漂移 dx −288~+480（experiments/diag_panel_dynamic.py），
+    暗块被游戏场景连通吞整屏（diag_panel_window.py）。
+    """
+    if (w, h) == tuple(_PANEL_REF_RES):
+        return FIXED_PANEL
+    key = f"{w}x{h}"
+    rects = _CFG.get("panel_rects", {})
+    if key in rects:
+        return tuple(rects[key])
+    if abs(w * 9 - h * 16) <= 8:  # 16:9（容忍 1366×768 类取整误差）
+        k = w / _PANEL_REF_RES[0]
+        px, py, pw, ph = FIXED_PANEL
+        x0, y0 = round(px * k), round(py * k)
+        x1, y1 = round((px + pw) * k), round((py + ph) * k)
+        if x0 <= 0 or y0 <= 0 or x1 > w or y1 > h:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+    return None
+
+
+def detect_fog_panel(bgr_screen: np.ndarray):
+    """按截屏物理尺寸适配地图面板（阶段C 比例适配）。返回 (x, y, w, h) 或 None。
+
+    旧 use_fixed=False 雾块连通块路径已删（实测不可作锚，见 panel_for_screen 注）。
+    """
+    return panel_for_screen(bgr_screen.shape[1], bgr_screen.shape[0])
 
 # 入口图标模板路径（config.paths.icon_template，相对项目根解析为绝对路径）。
 ICON_TEMPLATE = (ROOT / _CFG["icon_template"]).resolve()
@@ -55,28 +96,6 @@ def load_bgr(path: str) -> np.ndarray:
 
 # 游戏内地图迷雾的颜色（BGR 顺序）。RGB(37,47,58) -> BGR(58,47,37)
 FOG_BGR = np.array([58, 47, 37], dtype=np.int16)
-
-
-def detect_fog_panel(bgr_screen: np.ndarray, tol: int = 24, use_fixed: bool = True):
-    """检测地图迷雾面板，返回 (x0, y0, w, h)。
-
-    use_fixed=True(默认)：直接用固定面板，最稳。
-    use_fixed=False：动态检测最大迷雾连通块（探明多时不可靠）。
-    """
-    if use_fixed:
-        return FIXED_PANEL
-    a = bgr_screen.astype(np.int16)
-    d = np.abs(a - FOG_BGR).sum(axis=2)
-    mask = (d < tol).astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    if num < 2:
-        return None
-    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    x, y, w, h, area = stats[largest]
-    if area < 2000:
-        return None
-    return (int(x), int(y), int(w), int(h))
 
 
 def content_bbox(bgr_img: np.ndarray, thresh: int = 60) -> tuple[int, int, int, int]:

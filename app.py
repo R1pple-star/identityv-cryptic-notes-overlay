@@ -36,7 +36,7 @@ from core.entrance import (
     _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance, load_index,
 )
 from core.map_library import MapLibrary
-from core.vision import FIXED_PANEL, detect_fog_panel, load_bgr
+from core.vision import detect_fog_panel, load_bgr, panel_for_screen
 from ui.capture import capture_monitor
 from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
@@ -45,8 +45,8 @@ from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
 
 # DPI 缩放适配：让进程用物理像素（per-monitor DPI aware + Qt 禁用 high-DPI scaling），
-# 使 mss 截屏、Qt 窗口坐标、FIXED_PANEL 三者统一于物理像素。否则 125%/150% 缩放下
-# 截屏=逻辑像素而 FIXED_PANEL=物理坐标，错位致图标检偏、匹配退化(分0.000)、投影位置不对。
+# 使 mss 截屏、Qt 窗口坐标、面板坐标(panel_for_screen) 三者统一于物理像素。否则 125%/150% 缩放下
+# 截屏=逻辑像素而面板=物理坐标，错位致图标检偏、匹配退化(分0.000)、投影位置不对。
 import ctypes
 import os
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
@@ -342,14 +342,19 @@ class MainWindow(QWidget):
             return
         self._log_step("截屏 OK")
         shot = self._shot
+        panel = detect_fog_panel(shot)
+        if panel is None:
+            self._log_step(f"屏幕 {shot.shape[1]}×{shot.shape[0]} 未适配（非16:9且未校准；"
+                           "config.toml [panel.rects] 可加校准）", "ERROR")
+            return
         et = self.entrance_combo.currentText()
-        res, icon_pos, isc = find_seed_by_entrance(shot, self.lib, et, top_n=3)
+        res, icon_pos, isc = find_seed_by_entrance(shot, self.lib, et, panel=panel, top_n=3)
         if icon_pos is None:
             self._log_step(f"入口图标未检出(分{isc:.2f}) → 手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f}")
-        sample = _crop_around_icon(shot, FIXED_PANEL, icon_pos, self.settings.sample_half_frac)
+        sample = _crop_around_icon(shot, panel, icon_pos, self.settings.sample_half_frac)
         self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
         # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
         # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
@@ -425,7 +430,7 @@ class MainWindow(QWidget):
         ref = load_bgr(str(info.path))
         panel = detect_fog_panel(shot)
         if panel is None:
-            self.status.setText("未检测到地图迷雾面板——请先按 g 打开地图")
+            self.status.setText("屏幕分辨率未适配（非16:9且未校准）——3点标定仍可用")
             return None
         # 第一段：构造 M1 + 对齐尺度提示 hint_s（=入口匹配尺度 s）
         hint_s = None
@@ -453,7 +458,7 @@ class MainWindow(QWidget):
             return
         panel = detect_fog_panel(self._shot)
         if panel is None:
-            self.status.setText("未检测到地图迷雾面板——请先按 g 打开地图"); return
+            self.status.setText("屏幕分辨率未适配（非16:9且未校准）"); return
         ref = load_bgr(str(info.path))
         align = find_overlay_transform(self._shot, ref, panel)
         if align is None:
@@ -503,8 +508,11 @@ class MainWindow(QWidget):
         self._show_sample_preview(sample)
         et = self.entrance_combo.currentText()
         self._log_step(f"手框样本 {x1-x0}x{y1-y0}，重跑匹配", "INFO")
+        panel = detect_fog_panel(self._shot)
+        if panel is None:
+            self._log_step("屏幕分辨率未适配（非16:9且未校准）", "ERROR"); return
         res, icon_pos, isc = find_seed_by_entrance(
-            self._shot, self.lib, et, top_n=3, sample_crop=sample)
+            self._shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample)
         if not res:
             self._log_step("手框样本仍无匹配 → 检查框选或用3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=True)
@@ -515,7 +523,7 @@ class MainWindow(QWidget):
 
     # ---- 投影显示 ----
     def _screen_size(self):
-        # 用 mss 主显示器物理尺寸（DPI aware 后=物理像素），与截屏/FIXED_PANEL 一致；
+        # 用 mss 主显示器物理尺寸（DPI aware 后=物理像素），与截屏/面板坐标一致；
         # 不用 Qt primaryScreen.geometry()（DPI 缩放下可能返回逻辑像素致错位）
         import mss
         with mss.mss() as sct:
@@ -542,7 +550,10 @@ class MainWindow(QWidget):
 
     def _show_centered(self, ref):
         sw, sh = self._screen_size()  # _screen_size 返回 (width, height)
-        rgba, (ox, oy) = auto_align_overlay(ref, FIXED_PANEL, rotate=0)
+        panel = panel_for_screen(sw, sh)
+        if panel is None:  # 未适配分辨率：居中 75% 屏兜底，位置仅供人眼看
+            panel = (sw // 8, sh // 8, sw * 3 // 4, sh * 3 // 4)
+        rgba, (ox, oy) = auto_align_overlay(ref, panel, rotate=0)
         rh, rw = rgba.shape[:2]
         x0, y0 = max(0, ox), max(0, oy)
         x1, y1 = min(sw, ox + rw), min(sh, oy + rh)
@@ -699,7 +710,9 @@ def main():
         win.set_led(True, f"已启动 · {settings.hotkey} 已注册")
         win._log_step(f"热键已注册: {settings.hotkey}", "OK")
         sw, sh = win._screen_size()
-        win._log_step(f"屏幕 {sw}x{sh} 面板 {tuple(FIXED_PANEL)}（仅 1920x1080 精确）", "INFO")
+        p = panel_for_screen(sw, sh)
+        win._log_step(f"屏幕 {sw}x{sh} 面板 {tuple(p) if p else '未适配(非16:9，可config校准)'}"
+                      + ("" if (sw, sh) == (1920, 1080) else "（非基准分辨率，外推/校准值，未实测）"), "INFO")
         win._log_step("就绪：先按 g 打开游戏地图、刚进入口(图标在视野)，再 "
                       + settings.hotkey, "INFO")
     except Exception as e:  # noqa: BLE001

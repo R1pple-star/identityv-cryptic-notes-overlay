@@ -23,7 +23,7 @@ import cv2  # noqa: E402
 from core.alignment import find_overlay_transform  # noqa: E402
 from core.entrance import build_entrance_transform, find_seed_by_entrance, load_index  # noqa: E402
 from core.map_library import MapLibrary  # noqa: E402
-from core.vision import FIXED_PANEL, load_bgr  # noqa: E402
+from core.vision import load_bgr, panel_for_screen  # noqa: E402
 
 with open(ROOT / "config.toml", "rb") as _f:
     _CFG = tomllib.load(_f)
@@ -41,17 +41,20 @@ def _align_overlap(shot, best, entrance_type, icon_pos, lib):
     if info is None:
         return None
     ref = load_bgr(str(info.path))
+    panel = panel_for_screen(shot.shape[1], shot.shape[0])
+    if panel is None:
+        return None
     hint_s = None
     idx = load_index(best[1])
     if idx is not None:
-        m1 = build_entrance_transform(best, entrance_type, idx, icon_pos, FIXED_PANEL)
+        m1 = build_entrance_transform(best, entrance_type, idx, icon_pos, panel)
         if m1 is not None:
             hint_s = m1[1]
     if hint_s is not None:
-        a = find_overlay_transform(shot, ref, FIXED_PANEL, hint_s=hint_s)
+        a = find_overlay_transform(shot, ref, panel, hint_s=hint_s)
         if a is not None and a[1] < ALIGN_SCORE_MAX and a[2] >= OVERLAP_MIN:
             return a
-    return find_overlay_transform(shot, ref, FIXED_PANEL)
+    return find_overlay_transform(shot, ref, panel)
 
 
 def load_labels():
@@ -65,7 +68,11 @@ def load_labels():
 
 def evaluate_sample(shot, lib, entrance_type, gt_seed):
     """返回 dict: top3, best_seed, best_score, overlap, gate_pass, top1_correct, top3_correct。"""
-    res, ip, isc = find_seed_by_entrance(shot, lib, entrance_type, top_n=3)
+    panel = panel_for_screen(shot.shape[1], shot.shape[0])
+    if panel is None:
+        return dict(top3=[], best_seed=None, best_score=None, overlap=None,
+                    gate_pass=False, top1_correct=False, top3_correct=False, icon=0.0)
+    res, ip, isc = find_seed_by_entrance(shot, lib, entrance_type, panel=panel, top_n=3)
     if not res:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc)
