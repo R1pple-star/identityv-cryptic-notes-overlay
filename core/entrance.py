@@ -122,6 +122,10 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
             if sc < best_sc:
                 best_sc, best_s, best_mloc = sc, s, (int(ml[0]), int(ml[1]))
         info = lib.get(seed, "一楼")
+        if best_s is None:
+            # 无任何尺度放得下（样本大于该种子引索裁图，如手框过大）：不计入。
+            # 旧版计入 1e9 哨兵分，多种子全 1e9 时排序无意义 → 假种子居中显示（2026-09-13 实测）。
+            continue
         results.append((best_sc, seed, info.key if info else str(seed), fl,
                         best_s, best_mloc))
     results.sort(key=lambda x: x[0])

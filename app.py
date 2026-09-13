@@ -390,6 +390,10 @@ class MainWindow(QWidget):
             self._log_step(f"匹配退化(多种子同分 {sc:.3f}) → 图标可能假阳/贴边，请手框样本或3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=corrected)
             return
+        if sc >= 1e8:  # 哨兵分兜底（find_seed_by_entrance 已跳过无尺度种子，此处防御）
+            self._log_step("匹配无有效尺度（样本过大/引索缺）→ 框小一点(入口局部结构)或3点标定", "WARN")
+            self._log(et, res, icon_pos, isc, None, corrected=corrected)
+            return
         self.floor_combo.blockSignals(True); self.floor_combo.setCurrentText(fl)
         self.floor_combo.blockSignals(False)
         bdir, door = key.split("-", 1)
@@ -477,9 +481,11 @@ class MainWindow(QWidget):
             rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
             self._show_overlay(rgba)
             self.status.setText(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
+            self._log_step(f"手动重对齐: {info.key} 重合{asc:.2f} 重叠{ov:.2f} 已投影", "OK")
         else:
             self._show_centered(ref)
             self.status.setText(f"对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})，居中显示：{info.key}")
+            self._log_step(f"手动重对齐不可靠(重合{asc:.2f} 重叠{ov:.2f})，居中显示 {info.key}", "WARN")
 
     def _three_point_calib(self):
         """手动兜底：3 点标定（affine_from_points，3 下点击必对）。
@@ -523,7 +529,7 @@ class MainWindow(QWidget):
         res, icon_pos, isc = find_seed_by_entrance(
             self._shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample)
         if not res:
-            self._log_step("手框样本仍无匹配 → 检查框选或用3点标定", "WARN")
+            self._log_step("手框样本仍无匹配 → 框小一点(入口局部结构,约300px内)或用3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=True)
             return
         best = res[0]
