@@ -4,9 +4,10 @@
 ======================================
 热键(Ctrl+Shift+F) → 入口引索匹配定种子 → 两段式对齐 → 透明投影重合。
 
-一次热键 = 一个任务 = 一个结果。自动跟随状态机已按计划推迟（见 CLAUDE.md
-「不做」清单）；跟随实测可靠后再立项。废弃的整图识别(find_seed_submap /
-find_seed_color / detect_direction)已删，全部走入口引索 + 两段式对齐。
+一次热键 = 一个任务 = 一个结果。自动跟随·第一步已落地：游戏内 G 开关小地图时
+投影同步显隐（ui/follow.py 轮询 + 投影窗 WDA 截屏排除，见 CLAUDE.md）；其余跟随
+状态机（连续再对齐/自动重匹配）仍推迟，待开合跟随实测可靠后再立项。废弃的整图
+识别(find_seed_submap / find_seed_color / detect_direction)已删，全部走入口引索 + 两段式对齐。
 
 双闸（见 CLAUDE.md）：
   入口置信闸 = 入口分 < score_confident(0.10) 且 overlap ≥ overlap_min(0.40)（种子ID可信）
@@ -22,7 +23,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QRect
+from PySide6.QtCore import Qt, QRect, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox,
@@ -36,8 +37,9 @@ from core.entrance import (
     _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance, load_index,
 )
 from core.map_library import MapLibrary
-from core.vision import detect_fog_panel, load_bgr, panel_for_screen
-from ui.capture import capture_monitor
+from core.vision import detect_fog_panel, load_bgr, map_is_open, panel_for_screen
+from ui.capture import capture_monitor, capture_region
+from ui.follow import FOLLOW_INTERVAL_MS, FOLLOW_OPEN_THRESH, FollowState
 from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
@@ -179,6 +181,11 @@ class MainWindow(QWidget):
         self.overlay: MapOverlay | None = None
         self.preview: SamplePreview | None = None  # 入口样本预览窗（阶段3）
         self._last_shot_path = None  # 最近截图保存路径（log/回收用）
+        # 自动跟随·第一步（投影显隐跟随地图开合）：状态机 + 轮询定时器 + 面板缓存
+        self._follow = FollowState()
+        self._follow_timer: QTimer | None = None
+        self._follow_panel = None
+        self._follow_err = 0
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -255,6 +262,8 @@ class MainWindow(QWidget):
         self.setLayout(root)
         self.move(8, 60)
         self._on_direction_changed()
+        if self.settings.auto_follow:
+            self._start_follow()
 
     # ---- 无边框拖动 ----
     def mousePressEvent(self, e):
@@ -534,10 +543,12 @@ class MainWindow(QWidget):
         if self.overlay is None:
             sw, sh = self._screen_size()
             self.overlay = MapOverlay(QRect(0, 0, sw, sh))
+            if not self.overlay.capture_excluded:
+                self._log_step("投影未能排除截屏（跟随/重匹配可能受自污染）", "WARN")
         self.overlay.set_image(rgba)
         self.overlay.setWindowOpacity(self.opacity_slider.value() / 100.0)
-        self.overlay.show()
-        self.btn_hide.setText("👁 隐藏地图")  # 新投影显示后按钮复位为「隐藏」
+        self._set_overlay_visible(True)
+        self._follow.reset()  # 新投影=「我现在要投影」：清跟随挂起与确认态，重新 adopt
 
     def _show_sample_preview(self, bgr):
         """显示匹配用的入口样本（让玩家看到选对没），贴主窗右侧。"""
@@ -571,19 +582,88 @@ class MainWindow(QWidget):
             self._show_centered(load_bgr(str(info.path)))
 
     def _hide_overlay(self):
+        if self.settings.auto_follow and self.overlay is not None:
+            self._follow.suspend()
+            self._log_step("跟随已暂停（地图开合切换后自动恢复）", "WARN")
         if self.overlay is not None:
-            if self.overlay.isVisible():
-                self.overlay.hide()
-                self.btn_hide.setText("👁 显示地图")
-                self._log_step("地图已隐藏（再点一次显示）")
-            else:
-                self.overlay.show()
-                self.btn_hide.setText("👁 隐藏地图")
-                self._log_step("地图已显示")
+            visible = not self.overlay.isVisible()
+            self._set_overlay_visible(visible)
+            self._log_step("地图已显示" if visible else "地图已隐藏（再点一次显示）")
+
+    def _set_overlay_visible(self, visible: bool):
+        """投影显隐统一入口：show/hide + btn_hide 文案（_show_overlay/_hide_overlay/跟随共用）。"""
+        if self.overlay is None:
+            return
+        if visible:
+            self.overlay.show()
+            self.btn_hide.setText("👁 隐藏地图")
+        else:
+            self.overlay.hide()
+            self.btn_hide.setText("👁 显示地图")
 
     def _set_opacity(self, v):
         if self.overlay is not None:
             self.overlay.setWindowOpacity(v / 100.0)
+
+    # ---- 自动跟随·第一步：投影显隐跟随游戏内地图开合 ----
+    def _start_follow(self):
+        """启动跟随轮询（分辨率未适配则拒绝并提示）。"""
+        if self._follow_timer is not None and self._follow_timer.isActive():
+            return
+        panel = panel_for_screen(*self._screen_size())
+        if panel is None:
+            self._log_step("分辨率未适配，自动跟随不可用（非16:9，可config校准）", "ERROR")
+            return
+        self._follow_panel = panel
+        self._follow.reset()
+        self._follow_err = 0
+        if self._follow_timer is None:
+            self._follow_timer = QTimer(self)
+            self._follow_timer.setInterval(FOLLOW_INTERVAL_MS)
+            self._follow_timer.timeout.connect(self._follow_tick)
+        self._follow_timer.start()
+        self._log_step(f"自动跟随已开启：面板 {tuple(panel)} @ {FOLLOW_INTERVAL_MS}ms，"
+                       f"开闸阈值 {FOLLOW_OPEN_THRESH}", "OK")
+
+    def _stop_follow(self):
+        if self._follow_timer is not None and self._follow_timer.isActive():
+            self._follow_timer.stop()
+            self._log_step("自动跟随已关闭")
+        self._follow.reset()
+
+    def _follow_tick(self):
+        if not self.settings.auto_follow or self._follow_panel is None:
+            return
+        # 模态对话框/QMenu 是嵌套事件循环，QTimer 照常触发——期间不判定
+        if QApplication.activeModalWidget() or QApplication.activePopupWidget():
+            return
+        if self.overlay is None:  # 无投影不做事（需求：只管理已存在投影的可见性）
+            self._follow.idle_reset()
+            return
+        px, py, pw, ph = self._follow_panel
+        try:
+            crop = capture_region(px, py, pw, ph)
+        except Exception as e:  # noqa: BLE001
+            self._follow_err += 1
+            if self._follow_err == 1:
+                self._log_step(f"跟随截屏异常: {e}", "WARN")
+            elif self._follow_err >= FOLLOW_MAX_CAPTURE_ERRORS:
+                self._log_step(f"跟随截屏连续失败 {self._follow_err} 次，停止跟随", "ERROR")
+                self._stop_follow()
+            return
+        self._follow_err = 0
+        _b, frac = map_is_open(crop, panel=(0, 0, pw, ph))  # bool 忽略，用 frac（阈值在 ui 层）
+        evt = self._follow.feed(frac > FOLLOW_OPEN_THRESH)
+        if evt is None:
+            return  # 静默：稳定态/防抖中不刷日志
+        _kind, state = evt
+        if self._follow.suspended:
+            self._log_step(f"跟随暂停中（地图{'开' if state else '关'}），不动投影")
+            return
+        if self.overlay.isVisible() != state:
+            self._set_overlay_visible(state)
+        self._log_step(f"跟随: 地图{'开' if state else '关'} → 投影{'显示' if state else '隐藏'}"
+                       f"（内容占比 {frac:.2f}）")
 
     # ---- 失败回收（§6.3）：log.csv + inbox ----
     def _log(self, entrance_type, res, icon_pos, isc, align, corrected: bool):
@@ -672,6 +752,10 @@ class MainWindow(QWidget):
             except Exception as e:  # noqa: BLE001
                 self.set_led(False, "热键失败")
                 self._log_step(f"热键重注册失败: {e}（改回设置或重启）", "ERROR")
+        if self.settings.auto_follow:
+            self._start_follow()
+        else:
+            self._stop_follow()
 
     # ---- 素材管理 / 退出 ----
     def _manage_materials(self):

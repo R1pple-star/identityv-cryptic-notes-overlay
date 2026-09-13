@@ -29,6 +29,7 @@ class Settings:
     hotkey: str = "Ctrl+Shift+F"      # 热键串，启动时 parse 成 (vk, mods)
     show_log: bool = True             # 运行日志区显隐
     sample_half_frac: float = 0.18    # 入口样本裁剪半边比例（icon 贴边时内部自动增大到 0.25）
+    auto_follow: bool = True          # 自动跟随·第一步：G 开关游戏地图时投影同步显隐
 
 
 def load() -> Settings:
@@ -38,7 +39,7 @@ def load() -> Settings:
         if SETTINGS_PATH.exists():
             d = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             for k in ("overlay_opacity", "wall_alpha", "hotkey", "show_log",
-                      "sample_half_frac"):
+                      "sample_half_frac", "auto_follow"):
                 if k in d:
                     setattr(s, k, d[k])
     except Exception:  # noqa: BLE001
@@ -82,6 +83,9 @@ class SettingsDialog(QDialog):
         self.log_chk = QCheckBox("显示运行日志区")
         self.log_chk.setChecked(settings.show_log)
 
+        self.follow_chk = QCheckBox("自动跟随地图开合（G 开关小地图时投影同步显隐）")
+        self.follow_chk.setChecked(settings.auto_follow)
+
         self.sample_spin = QDoubleSpinBox()
         self.sample_spin.setRange(0.05, 0.40); self.sample_spin.setSingleStep(0.01)
         self.sample_spin.setValue(settings.sample_half_frac)
@@ -94,6 +98,7 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.wall_label); lay.addWidget(self.wall_slider)
         lay.addWidget(QLabel("热键（修饰键+主键，用 + 连接）")); lay.addWidget(self.hk_edit)
         lay.addWidget(self.log_chk)
+        lay.addWidget(self.follow_chk)
         lay.addWidget(QLabel("入口样本裁剪比例（手框样本范围参考）"))
         lay.addWidget(self.sample_spin)
         row = QHBoxLayout(); row.addWidget(btn_ok); row.addWidget(btn_cancel); row.addStretch(1)
@@ -113,5 +118,6 @@ class SettingsDialog(QDialog):
             hotkey=hk,
             show_log=self.log_chk.isChecked(),
             sample_half_frac=float(self.sample_spin.value()),
+            auto_follow=self.follow_chk.isChecked(),
         )
         self.accept()

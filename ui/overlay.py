@@ -11,10 +11,16 @@
 """
 from __future__ import annotations
 
+import ctypes
+
 import numpy as np
 from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QLabel, QWidget
+
+# 投影窗从截屏画面排除（屏上正常显示，但 mss/热键全屏截屏/OBS/录屏拍不到）。
+# 禁用 WDA_MONITOR(0x1)：全屏窗会整块变黑，热键全屏截屏全毁。e1 实验验证过 0x11。
+WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
 def rgba_to_qimage(rgba: np.ndarray) -> QImage:
@@ -24,7 +30,7 @@ def rgba_to_qimage(rgba: np.ndarray) -> QImage:
 
 
 class MapOverlay(QWidget):
-    def __init__(self, geometry: QRect):
+    def __init__(self, geometry: QRect, exclude_capture: bool = True):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -40,6 +46,19 @@ class MapOverlay(QWidget):
         self._label.setGeometry(0, 0, geometry.width(), geometry.height())
         self._label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._label.setScaledContents(False)
+
+        # 截屏排除：防自截污染——投影墙体若进截屏会被 classify 成 structure，
+        # 地图已关时仍被 map_is_open 判「开」（跟随死锁）；热键重匹配同理吃到污染。
+        # 注意：winId() 已强制创建原生窗，此后不得再 setWindowFlags（重建 HWND 丢 affinity）。
+        self.capture_excluded = self._set_capture_exclusion() if exclude_capture else False
+
+    def _set_capture_exclusion(self, affinity: int = WDA_EXCLUDEFROMCAPTURE) -> bool:
+        """把本窗从截屏画面排除。失败（offscreen 平台/旧系统）返回 False，绝不抛。"""
+        try:
+            return bool(ctypes.windll.user32.SetWindowDisplayAffinity(
+                int(self.winId()), affinity))
+        except Exception:  # noqa: BLE001
+            return False
 
     def set_image(self, rgba: np.ndarray) -> None:
         """rgba: (h, w, 4) uint8。"""
