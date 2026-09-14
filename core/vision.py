@@ -140,17 +140,23 @@ def classify_map(bgr):
     return classify_region(bgr)
 
 
-def _find_icon(bgr, px, py, pw, ph, scales=(0.5, 0.65, 0.85, 1.0, 1.3, 1.7, 2.2)):
+def _find_icon(bgr, px, py, pw, ph,
+               scales=None):
     """在面板内找白色箭头入口图标（排除黄色玩家图标）。多尺度，能抓到随地图缩放缩小的图标。
 
-    返回 (中心坐标, 分数) 或 (None, 分)。
+    尺度网格细至 0.05 步（0.35-1.30）+ 上方粗档：真实图标尺度是「图标当尺子」的依据
+    （core.entrance._crop_around_icon 按 k 缩放裁样），必须量准；旧粗网格下限 0.5 会把
+    8 月基线图标钉在网格底（实测真 k=0.40-0.45，细化后 NCC 0.64→0.81+）。
+    返回 (中心坐标, 分数, 获胜尺度k) 或 (None, 分, None)。
     """
+    if scales is None:
+        scales = tuple(round(0.35 + 0.05 * i, 2) for i in range(20)) + (1.5, 1.7, 2.0, 2.2)
     icon_path = ICON_TEMPLATE
     if not icon_path.exists():
-        return None, 0  # 缺图标模板不检测（新结构由 assets/_icon_entrance.png 提供；旧版自动从硬编码截图创建的逻辑已删）
+        return None, 0, None  # 缺图标模板不检测（新结构由 assets/_icon_entrance.png 提供；旧版自动从硬编码截图创建的逻辑已删）
     icon = cv2.imread(str(icon_path), cv2.IMREAD_GRAYSCALE)
     if icon is None:
-        return None, 0
+        return None, 0, None
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     panel_gray = gray[py:py + ph, px:px + pw]
@@ -161,7 +167,7 @@ def _find_icon(bgr, px, py, pw, ph, scales=(0.5, 0.65, 0.85, 1.0, 1.3, 1.7, 2.2)
     yh, yw = panel_gray.shape[0], panel_gray.shape[1]
 
     iw, ih = icon.shape[1], icon.shape[0]
-    best_score, best_pos = 0.0, None
+    best_score, best_pos, best_k = 0.0, None, None
     for scale in scales:
         siw, sih = max(8, int(iw * scale)), max(8, int(ih * scale))
         if siw > pw or sih > ph:
@@ -181,11 +187,11 @@ def _find_icon(bgr, px, py, pw, ph, scales=(0.5, 0.65, 0.85, 1.0, 1.3, 1.7, 2.2)
                 res[max(0, my - 3):my + 3, max(0, mx - 3):mx + 3] = -1
                 continue
             if mv > best_score:
-                best_score, best_pos = mv, (px + mx + siw // 2, py + my + sih // 2)
+                best_score, best_pos, best_k = mv, (px + mx + siw // 2, py + my + sih // 2), scale
             break
     if best_pos is None or best_score < 0.58:
-        return None, best_score
-    return best_pos, best_score
+        return None, best_score, None
+    return best_pos, best_score, best_k
 
 
 def follow_features(region):

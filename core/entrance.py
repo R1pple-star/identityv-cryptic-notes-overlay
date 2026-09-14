@@ -30,8 +30,22 @@ with open(ROOT / "config.toml", "rb") as _f:
 # 入口引索目录（config.paths.entrance_index，相对项目根解析）。
 ENTRANCE_INDEX_DIR = (ROOT / _CFG["paths"]["entrance_index"]).resolve()
 ENTRANCE_FLOOR = {"正门": "一楼", "侧门": "一楼", "二楼": "二楼"}
-# 入口裁图尺度接近(都~200px)，窄范围多尺度对齐
-SCALES_ENT = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4)
+# 入口裁图尺度接近(都~200px)，窄范围多尺度对齐。下限 0.35：游戏默认（不碰缩放）入口
+# 状态 s≈0.40（2026-09-14 实测 6 局图标 k=1.0，s=0.4/k），旧下限 0.6 会把默认态全部
+# 撞底钉住 → 匹分失真/同分退化。上界不变（观测域）。
+SCALES_ENT = (0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4)
+# 最小模板世界覆盖闸：模板边长 < 此值直接跳过该尺度。旧下限 0.6 隐式兼任防小模板假
+# 获胜（小模板塞进均匀区 SQDIFF 偏低——17.13 实测种子16 在 s=0.55 以 112px 模板拿
+# 0.039 反超真种子 0.046）；扩域到 0.35 后必须显式补上。实测真匹配模板世界覆盖
+# 163-204 参考px（k∈[0.40,1.0] 经 ruler/基线裁样），150 = 下沿留 ~8% 余量。大裁样
+# （k 放大后 ~464px）在 0.35 档模板 162px 仍可搜，204px 基线裁样 0.735 以下全挡。
+MIN_TEMPLATE_PX = 150
+# 图标当尺子·棘轮基准：k 高于此值才放大裁样（k≤此值保持基线 half=102px）。8 月全部
+# 基线数据 k∈[0.40,0.45]（细网格 NCC 峰）→ 棘轮保证其逐像素零扰动；默认档 k≈1.0 →
+# half≈232，世界覆盖回到 8 月水平（~184 参考px）。s 与裁框大小无关，扩大取样梯子救
+# 不了缩放——缩放只有这条 ruler 路径；只放大不缩小，缩小会让小模板假获胜（17.13 实测
+# 纯 ruler 缩到 186px → 错种子 0.031 反超）。
+ICON_K_REF = float(_CFG["match"].get("icon_k_ref", 0.44))
 # 渐变迷雾剔除 + 房间加权（config [match]；迷雾是渐变色，仅 tol24 精确色剔不净外圈，
 # 膨胀雾核一并剔；房间亮度两侧都远离雾色、误判率最低→加权，通路易被雾污染→降权）
 _FOG_DILATE = int(_CFG["match"].get("fog_dilate", 5))
@@ -39,14 +53,29 @@ _ROOM_W = float(_CFG["match"].get("room_weight", 2.0))
 _PASS_W = float(_CFG["match"].get("passage_weight", 0.5))
 
 
-def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18):
-    """以入口图标为中心裁方区域。icon 贴面板边缘时自动增大到 0.25（含更多入口结构，
-    避免退化致匹配 0.000）；中央时 half_frac=0.18（基线不变）。方框 clamp 入面板不截断。"""
+def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18, icon_k=None):
+    """以入口图标为中心裁方区域，裁样大小按图标检测尺度 k 放大（「图标当尺子·棘轮」）。
+
+    游戏内放大（默认档 k≈1.0 / 玩家缩放）会让固定 half_frac 的裁样只覆盖一小块世界 →
+    房形信息缺失、单类退化；且 s 与裁框大小无关，扩大取样救不了缩放。故 k>K_REF 时
+    half ∝ k/ICON_K_REF 放大裁样，把世界覆盖拉回基线水平。
+    **只放大不缩小（棘轮）**：k≤K_REF 保持基线 half_frac 行为——缩小裁样会丢信息让
+    小模板假获胜（2026-09-14 实测 17.13 k=0.40 纯 ruler 缩到 186px → 错种子 0.031 反超），
+    且 8 月全部基线数据 k≤0.45，棘轮保证其逐像素零扰动。
+    half 另设上限 min(pw,ph)//2：k 量偏大/贴边档放大时防止裁样超过 228/SCALES_ENT[0]
+    → 全尺度放不进引索 → 匹配恒空（同日实测 710px 裁样全'-'）。
+    icon 贴面板边缘时自动增大到 0.25 档（同乘 k 放大）。方框 clamp 入面板不截断。
+    icon_k=None（手框样本等无图标尺度的场景）→ 保持旧行为不缩放。"""
     px, py, pw, ph = panel
     cx, cy = icon_pos
     cxp, cyp = cx - px, cy - py
-    half = int(min(pw, ph) * half_frac)
-    edge = int(min(pw, ph) * 0.25)
+    kf = max(1.0, (icon_k / ICON_K_REF)) if icon_k else 1.0
+    # 上限 316=228/0.36/2：放大档(k≈1.0→真s≈0.36-0.40)下侧长 632×0.36=228 恰可搜，
+    # 再大会把真尺度挤出可行域（710px 裁样实测全'-'）。同时保护梯子：0.25/0.32 档
+    # 在默认缩放下不至于全顶到同一个帽（284 帽实测压扁梯子 → 144715 丢失梯子救援）。
+    half_cap = 316
+    half = min(int(min(pw, ph) * half_frac * kf), half_cap)
+    edge = min(int(min(pw, ph) * 0.25 * kf), half_cap)
     if cxp < edge or cxp > pw - edge or cyp < edge or cyp > ph - edge:
         half = edge  # 贴边 → 增大样本（17.13 中央不触发，基线不变）
     region = shot[py:py + ph, px:px + pw]
@@ -81,21 +110,23 @@ def build_sample_mask(crop):
 def find_seed_by_entrance(shot, lib, entrance_type: str,
                           index_dir=ENTRANCE_INDEX_DIR, panel=FIXED_PANEL,
                           top_n=6, sample_crop=None):
-    """入口引索匹配。返回 ([(score, seed, 方向-门, 楼层, s, mloc), ...], icon_pos, icon_score)。
+    """入口引索匹配。返回 ([(score, seed, 方向-门, 楼层, s, mloc), ...], icon_pos, icon_score, icon_k)。
 
     score 越小越匹配。entrance_type ∈ {正门, 侧门, 二楼}。
     s 为获胜尺度(SCALES_ENT)，mloc=(mlx,mly) 为该尺度下 matchTemplate 在参考裁图里的
     argmin 位置；二者供 build_entrance_transform 构造两段式对齐第一段 M1。缺时为 None。
+    icon_k 为图标检测获胜尺度（「图标当尺子」，裁样按它缩放），缺时 None。
     sample_crop: 手动框选的入口样本(HxWx3 BGR)，阶段3 手框纠错用；给了则用它做
     in_cls/in_mask(跳过 _crop_around_icon)，None 则自动以图标为中心裁。默认 None=基线。
     """
-    icon_pos, icon_score = _find_icon(shot, *panel)
+    icon_pos, icon_score, icon_k = _find_icon(shot, *panel)
     if icon_pos is None and sample_crop is None:
-        return [], None, 0.0
-    in_crop = sample_crop if sample_crop is not None else _crop_around_icon(shot, panel, icon_pos)
+        return [], None, 0.0, None
+    in_crop = sample_crop if sample_crop is not None else _crop_around_icon(
+        shot, panel, icon_pos, icon_k=icon_k)
     in_cls, in_mask, in_w = build_sample_mask(in_crop)
     if in_mask.sum() < 100:
-        return [], icon_pos, icon_score
+        return [], icon_pos, icon_score, icon_k
 
     fl = ENTRANCE_FLOOR[entrance_type]
     results = []
@@ -110,6 +141,8 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         for s in SCALES_ENT:
             tw, th = int(in_cls.shape[1] * s), int(in_cls.shape[0] * s)
             if tw < 10 or th < 10 or th > idx_cls.shape[0] or tw > idx_cls.shape[1]:
+                continue
+            if min(tw, th) < MIN_TEMPLATE_PX:  # 防小模板假获胜（见常量注释）
                 continue
             tcl = cv2.resize(in_cls, (tw, th), interpolation=cv2.INTER_NEAREST)
             tmk = cv2.resize(in_w, (tw, th), interpolation=cv2.INTER_NEAREST)
@@ -129,7 +162,7 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         results.append((best_sc, seed, info.key if info else str(seed), fl,
                         best_s, best_mloc))
     results.sort(key=lambda x: x[0])
-    return results[:top_n], icon_pos, icon_score
+    return results[:top_n], icon_pos, icon_score, icon_k
 
 
 def load_index(seed: int, index_dir=ENTRANCE_INDEX_DIR) -> dict | None:
@@ -178,7 +211,7 @@ if __name__ == "__main__":
         shot = load_bgr(p)
         print(f"\n=== {ts} 真种子{seed} ===")
         for et in ("正门", "侧门", "二楼"):
-            res, ip, isc = find_seed_by_entrance(shot, lib, et, top_n=3)
+            res, ip, isc, _k = find_seed_by_entrance(shot, lib, et, top_n=3)
             if not res:
                 print(f"  [{et}] 图标未检出/无匹配 (图标分{isc:.2f})")
                 continue

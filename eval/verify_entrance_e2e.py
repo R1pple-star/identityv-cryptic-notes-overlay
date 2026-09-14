@@ -30,7 +30,7 @@ def main():
         print(f"\n=== {ts} 真种子{seed} ===")
         chosen = None
         for et in ("侧门", "二楼", "正门"):  # 侧门/二楼优先(判别力强)
-            res, ip, isc = find_seed_by_entrance(shot, lib, et, panel=panel, top_n=3)
+            res, ip, isc, _ik = find_seed_by_entrance(shot, lib, et, panel=panel, top_n=3)
             if not res:
                 continue
             best, second = res[0], (res[1] if len(res) > 1 else (1e9,))
@@ -41,7 +41,7 @@ def main():
                 chosen = (et, best)
         if chosen is None:
             # 退而取侧门最佳(即便不确信)
-            res, _, _ = find_seed_by_entrance(shot, lib, "侧门", panel=panel, top_n=1)
+            res, _, _, _ = find_seed_by_entrance(shot, lib, "侧门", panel=panel, top_n=1)
             chosen = ("侧门", res[0]) if res else None
         if chosen is None:
             print("  无匹配，跳过重合"); continue

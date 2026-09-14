@@ -376,13 +376,14 @@ class MainWindow(QWidget):
                            "config.toml [panel.rects] 可加校准）", "ERROR")
             return
         et = self.entrance_combo.currentText()
-        res, icon_pos, isc = find_seed_by_entrance(shot, self.lib, et, panel=panel, top_n=3)
+        res, icon_pos, isc, icon_k = find_seed_by_entrance(shot, self.lib, et, panel=panel, top_n=3)
         if icon_pos is None:
             self._log_step(f"入口图标未检出(分{isc:.2f}) → 手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
-        self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f}")
-        sample = _crop_around_icon(shot, panel, icon_pos, self.settings.sample_half_frac)
+        self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f} k={icon_k}")
+        sample = _crop_around_icon(shot, panel, icon_pos, self.settings.sample_half_frac,
+                                   icon_k=icon_k)
         # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
         # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
         _cls, smask, _w = build_sample_mask(sample)
@@ -403,11 +404,11 @@ class MainWindow(QWidget):
             for hf in SAMPLE_LADDER:
                 if res and not _degenerate(res):
                     break
-                sample2 = _crop_around_icon(shot, panel, icon_pos, hf)
+                sample2 = _crop_around_icon(shot, panel, icon_pos, hf, icon_k=icon_k)
                 _cls2, smask2, _w2 = build_sample_mask(sample2)
                 if smask2.mean() < SAMPLE_MASK_MIN:
                     continue  # 更大的框反而更空（罕见）：跳过该档
-                res2, _ip, _isc = find_seed_by_entrance(
+                res2, _ip, _isc, _ik = find_seed_by_entrance(
                     shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample2)
                 if not res2:
                     continue
@@ -578,11 +579,12 @@ class MainWindow(QWidget):
             self._log_step("手框取消", "INFO"); return
         x0, y0, x1, y1 = pk.rect
         sample = self._shot[y0:y1, x0:x1].copy()
-        # 尺度硬上限：SCALES_ENT 最小 0.6 × 引索裁图 228px = 380px，超限全尺度放不下
-        # → 各种子直接跳过、res 恒空（2026-09-14 实测手框 408px「仍无匹配」即此因）。
-        if max(sample.shape[:2]) > 380:
-            self._log_step(f"手框 {x1-x0}x{y1-y0} 超过380px（引索尺度下限 0.6×228）→ "
-                           "请框300px内、含墙角/房间边缘结构的区域", "WARN")
+        # 尺度硬上限：SCALES_ENT 最小 0.35，样本边 × s 须 ≤ 引索裁图 228px → 228/0.35≈650
+        # 超限全尺度放不下 → 各种子直接跳过、res 恒空（2026-09-14 实测手框 408px「仍无匹配」即此因，
+        # 380px 旧上限是 0.6 下限时代所设）。
+        if max(sample.shape[:2]) > 650:
+            self._log_step(f"手框 {x1-x0}x{y1-y0} 超过650px（引索尺度下限 0.35×228）→ "
+                           "请框含墙角/房间边缘结构的区域", "WARN")
             return
         self._show_sample_preview(sample)
         et = self.entrance_combo.currentText()
@@ -590,7 +592,7 @@ class MainWindow(QWidget):
         panel = detect_fog_panel(self._shot)
         if panel is None:
             self._log_step("屏幕分辨率未适配（非16:9且未校准）", "ERROR"); return
-        res, icon_pos, isc = find_seed_by_entrance(
+        res, icon_pos, isc, _ik = find_seed_by_entrance(
             self._shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample)
         if not res:
             self._log_step("手框样本仍无匹配 → 框小一点(入口局部结构,约300px内)或用3点标定", "WARN")

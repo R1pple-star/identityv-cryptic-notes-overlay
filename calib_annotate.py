@@ -59,7 +59,7 @@ def make_annotated(bgr_full, panel=FIXED_PANEL, overlay=True):
         region[:] = cv2.addWeighted(region, 0.35, vis, 0.65, 0)
 
     cv2.rectangle(img, (px, py), (px + pw, py + ph), C_PANEL, 2)
-    icon_pos, icon_score = _find_icon(bgr_full, px, py, pw, ph)  # 用原图检测图标（勿用已 addWeighted 标注的 img，否则白箭头被混色→检不出）
+    icon_pos, icon_score, _k = _find_icon(bgr_full, px, py, pw, ph)  # 用原图检测图标（勿用已 addWeighted 标注的 img，否则白箭头被混色→检不出）
     if icon_pos:
         cv2.rectangle(img, (icon_pos[0] - 22, icon_pos[1] - 22),
                       (icon_pos[0] + 22, icon_pos[1] + 22), C_ICON, 2)

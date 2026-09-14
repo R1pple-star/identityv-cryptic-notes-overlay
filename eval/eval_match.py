@@ -86,22 +86,30 @@ def resolve_shot(fname: str):
 
 
 def evaluate_sample(shot, lib, entrance_type, gt_seed):
-    """返回 dict: top3, best_seed, best_score, overlap, gate_pass, top1_correct, top3_correct, degenerate。"""
+    """返回 dict: top3, best_seed, best_score, overlap, gate_pass, top1_correct, top3_correct, degenerate, rejected。
+
+    rejected=True = 触发快速失败闸（mask<SAMPLE_MASK_MIN 未探明）——app 同款行为是拒答
+    并提示「周围已探明再按」，不产生任何匹配主张，故不计入 top-1/top-3 分母、单列统计。"""
     panel = panel_for_screen(shot.shape[1], shot.shape[0])
     if panel is None:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=0.0,
-                    degenerate=False)
-    res, ip, isc = find_seed_by_entrance(shot, lib, entrance_type, panel=panel, top_n=3)
-    if not res:
+                    degenerate=False, rejected=True)
+    res, ip, isc, ik = find_seed_by_entrance(shot, lib, entrance_type, panel=panel, top_n=3)
+    if not ip or not res:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
-                    degenerate=False)
+                    degenerate=False, rejected=False)
+    # 快速失败闸镜像（app._entrance_pipeline_impl 同款先于匹配）：未探明样本 app 拒答。
+    cls, mask, _ = build_sample_mask(_crop_around_icon(shot, panel, ip, 0.18, icon_k=ik))
+    if mask.mean() < SAMPLE_MASK_MIN:
+        return dict(top3=[], best_seed=None, best_score=None, overlap=None,
+                    gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
+                    degenerate=False, rejected=True)
     # 扩大取样梯子（与 app._entrance_pipeline_impl 保持同步）：单类占比>阈值且
     # 当前档退化 → 0.25/0.32 重裁重匹配，首个非退化即停；全退化维持首档结果
     # （下游闸自会拦，排名统计口径与不救时一致）。
     if ip is not None:
-        cls, mask, _ = build_sample_mask(_crop_around_icon(shot, panel, ip, 0.18))
         tot = int(mask.sum())
         dom = (max(float(((cls == c) & (mask > 0)).sum()) / max(1, tot) for c in (1, 2, 3))
                if tot > 0 else 1.0)
@@ -109,11 +117,11 @@ def evaluate_sample(shot, lib, entrance_type, gt_seed):
             for hf in (0.25, 0.32):
                 if res and not _degen(res):
                     break
-                crop = _crop_around_icon(shot, panel, ip, hf)
+                crop = _crop_around_icon(shot, panel, ip, hf, icon_k=ik)
                 _c2, m2, _ = build_sample_mask(crop)
                 if m2.mean() < SAMPLE_MASK_MIN:
                     continue
-                r2, _ip2, _isc2 = find_seed_by_entrance(
+                r2, _ip2, _isc2, _ik2 = find_seed_by_entrance(
                     shot, lib, entrance_type, panel=panel, top_n=3, sample_crop=crop)
                 if r2:
                     res = r2
@@ -125,7 +133,7 @@ def evaluate_sample(shot, lib, entrance_type, gt_seed):
     ov = align[2] if align else None
     gate = (best[0] < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
     return dict(top3=top3, best_seed=best[1], best_score=best[0], overlap=ov,
-                gate_pass=gate, icon=isc, degenerate=degenerate,
+                gate_pass=gate, icon=isc, degenerate=degenerate, rejected=False,
                 top1_correct=(best[1] == gt_seed),
                 top3_correct=(gt_seed in [r[1] for r in res]))
 
@@ -136,11 +144,11 @@ def main():
     rows = load_labels()
     print(f"标注集: {len(rows)} 张 (eval/labels.csv)\n")
     hdr = (f"{'file':<40}{'view':<5}{'et':<5}{'GT':<4}{'best':<5}{'分':<7}"
-           f"{'overlap':<8}{'闸':<3}{'退':<3}{'top1':<5}{'top3'}")
+           f"{'overlap':<8}{'闸':<3}{'退':<3}{'拒':<3}{'top1':<5}{'top3'}")
     print(hdr); print("-" * len(hdr))
 
-    main_n = main_t1 = main_t3 = main_gate = main_deg = 0
-    ctrl_n = ctrl_fp = 0
+    main_n = main_t1 = main_t3 = main_gate = main_deg = main_rej = 0
+    ctrl_n = ctrl_fp = ctrl_rej = 0
     for r in rows:
         p = resolve_shot(r["file"])
         if p is None:
@@ -155,26 +163,37 @@ def main():
         t1 = "✓" if e["top1_correct"] else "✗"
         t3 = "✓" if e["top3_correct"] else "✗"
         deg = "!" if e["degenerate"] else " "
+        rej = "拒" if e["rejected"] else " "
         ov_txt = f"{e['overlap']:.2f}" if e["overlap"] is not None else "-"
         sc_txt = f"{e['best_score']:.3f}" if e["best_score"] is not None else "-"
         print(f"{r['file'][:40]:<40}{view:<5}{et:<5}{gt:<4}{(e['best_seed'] or '-'):<5}"
-              f"{sc_txt:<7}{ov_txt:<8}{gate:<3}{deg:<3}{t1:<5}{t3}")
+              f"{sc_txt:<7}{ov_txt:<8}{gate:<3}{deg:<3}{rej:<3}{t1:<5}{t3}")
         if is_view:
             main_n += 1
+            if e["rejected"]:
+                main_rej += 1  # 拒答不计入 top-1/top-3 分母（app 同款：不产生匹配主张）
+                continue
             main_t1 += int(e["top1_correct"])
             main_t3 += int(e["top3_correct"])
             main_gate += int(e["gate_pass"])
             main_deg += int(e["degenerate"])
         else:
             ctrl_n += 1
+            if e["rejected"]:
+                ctrl_rej += 1
+                continue
             ctrl_fp += int(e["gate_pass"])  # 控制组确信 = 误报
 
     print("-" * len(hdr))
-    print(f"\n主集(刚进入口): top-1 {main_t1}/{main_n}  top-3 {main_t3}/{main_n}  "
-          f"overlap闸通过 {main_gate}/{main_n}  匹配退化 {main_deg}/{main_n}")
-    fp_rate = (ctrl_fp / ctrl_n) if ctrl_n else 0
-    print(f"控制组(非刚进入口): 误报率 {ctrl_fp}/{ctrl_n} = {fp_rate:.0%} "
-          f"(确信=误报，应为0)")
+    answered = main_n - main_rej
+    print(f"\n主集(刚进入口): 应答 top-1 {main_t1}/{answered}  top-3 {main_t3}/{answered}  "
+          f"overlap闸通过 {main_gate}/{answered}  匹配退化 {main_deg}/{answered}")
+    print(f"  正确拒绝(未探明mask<{SAMPLE_MASK_MIN:.0%}, app拒答) {main_rej}/{main_n}"
+          " —— 不计入应答分母")
+    ctrl_ans = ctrl_n - ctrl_rej
+    fp_rate = (ctrl_fp / ctrl_ans) if ctrl_ans else 0
+    print(f"控制组(非刚进入口): 误报率 {ctrl_fp}/{ctrl_ans} = {fp_rate:.0%} "
+          f"(确信=误报，应为0；另拒答{ctrl_rej})")
     print(f"闸: 入口分<{SCORE_CONFIDENT} 且 overlap≥{OVERLAP_MIN}；对齐显示分<{ALIGN_SCORE_MAX}")
 
 
