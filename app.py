@@ -37,9 +37,11 @@ from core.entrance import (
     _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance, load_index,
 )
 from core.map_library import MapLibrary
-from core.vision import detect_fog_panel, load_bgr, map_is_open, panel_for_screen
+from core.vision import detect_fog_panel, follow_features, load_bgr, panel_for_screen
 from ui.capture import capture_monitor, capture_region
-from ui.follow import FOLLOW_INTERVAL_MS, FOLLOW_OPEN_THRESH, FollowState
+from ui.follow import (
+    FOLLOW_FOG_THRESH, FOLLOW_INTERVAL_MS, FOLLOW_STRUCT_THRESH, FollowState,
+)
 from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
@@ -186,6 +188,7 @@ class MainWindow(QWidget):
         self._follow_timer: QTimer | None = None
         self._follow_panel = None
         self._follow_err = 0
+        self._follow_poll_paused = False  # 投影隐藏导致的轮询暂停（一次性日志防刷屏）
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -588,13 +591,19 @@ class MainWindow(QWidget):
             self._show_centered(load_bgr(str(info.path)))
 
     def _hide_overlay(self):
-        if self.settings.auto_follow and self.overlay is not None:
-            self._follow.suspend()
-            self._log_step("跟随已暂停（地图开合切换后自动恢复）", "WARN")
-        if self.overlay is not None:
-            visible = not self.overlay.isVisible()
-            self._set_overlay_visible(visible)
-            self._log_step("地图已显示" if visible else "地图已隐藏（再点一次显示）")
+        if self.overlay is None:
+            return
+        visible = not self.overlay.isVisible()
+        if self.settings.auto_follow:
+            if visible:
+                self._follow.resume()
+            else:
+                self._follow.suspend()
+        self._set_overlay_visible(visible)
+        if visible:
+            self._log_step("地图已显示（跟随已恢复）")
+        else:
+            self._log_step("地图已隐藏（跟随暂停：G 不再自动唤起；点此按钮或按热键重新匹配可恢复）")
 
     def _set_overlay_visible(self, visible: bool):
         """投影显隐统一入口：show/hide + btn_hide 文案（_show_overlay/_hide_overlay/跟随共用）。"""
@@ -628,8 +637,8 @@ class MainWindow(QWidget):
             self._follow_timer.setInterval(FOLLOW_INTERVAL_MS)
             self._follow_timer.timeout.connect(self._follow_tick)
         self._follow_timer.start()
-        self._log_step(f"自动跟随已开启：面板 {tuple(panel)} @ {FOLLOW_INTERVAL_MS}ms，"
-                       f"开闸阈值 {FOLLOW_OPEN_THRESH}", "OK")
+        self._log_step(f"自动跟随已开启：面板 {tuple(panel)} @ {FOLLOW_INTERVAL_MS}ms（仅投影可见期间轮询，"
+                       f"隐藏即停不扰 NVIDIA 截图），开闸: 雾≥{FOLLOW_FOG_THRESH} 或 结构≥{FOLLOW_STRUCT_THRESH}", "OK")
 
     def _stop_follow(self):
         if self._follow_timer is not None and self._follow_timer.isActive():
@@ -643,9 +652,17 @@ class MainWindow(QWidget):
         # 模态对话框/QMenu 是嵌套事件循环，QTimer 照常触发——期间不判定
         if QApplication.activeModalWidget() or QApplication.activePopupWidget():
             return
-        if self.overlay is None:  # 无投影不做事（需求：只管理已存在投影的可见性）
+        # 只在投影可见期间轮询：隐藏即停止一切截屏检测（游戏中 NVIDIA 截图可正常用，
+        # 2026-09-14 用户实测旧版常驻轮询干扰英伟达截屏）。重开地图想看投影按热键
+        # 重新匹配或点「显示地图」。见 ui/follow.py 模块头。
+        if self.overlay is None or not self.overlay.isVisible():
+            if self.overlay is not None and not self._follow_poll_paused:
+                self._follow_poll_paused = True
+                self._log_step("投影已隐藏，跟随检测暂停（NVIDIA 截图可用；"
+                               "重开地图请按热键或点『显示地图』）")
             self._follow.idle_reset()
             return
+        self._follow_poll_paused = False
         px, py, pw, ph = self._follow_panel
         try:
             crop = capture_region(px, py, pw, ph)
@@ -658,8 +675,10 @@ class MainWindow(QWidget):
                 self._stop_follow()
             return
         self._follow_err = 0
-        _b, frac = map_is_open(crop, panel=(0, 0, pw, ph))  # bool 忽略，用 frac（阈值在 ui 层）
-        evt = self._follow.feed(frac > FOLLOW_OPEN_THRESH)
+        # 双特征判定（旧 content 单特征会被 Alt/F 等画面亮度变化误触发，见 follow.py 模块头）
+        content, fog, struct = follow_features(crop)
+        is_open = (fog >= FOLLOW_FOG_THRESH) or (struct >= FOLLOW_STRUCT_THRESH)
+        evt = self._follow.feed(is_open)
         if evt is None:
             return  # 静默：稳定态/防抖中不刷日志
         _kind, state = evt
@@ -669,7 +688,7 @@ class MainWindow(QWidget):
         if self.overlay.isVisible() != state:
             self._set_overlay_visible(state)
         self._log_step(f"跟随: 地图{'开' if state else '关'} → 投影{'显示' if state else '隐藏'}"
-                       f"（内容占比 {frac:.2f}）")
+                       f"（雾{fog:.2f} 结构{struct:.2f} 亮度{content:.2f}）")
 
     # ---- 失败回收（§6.3）：log.csv + inbox ----
     def _log(self, entrance_type, res, icon_pos, isc, align, corrected: bool):

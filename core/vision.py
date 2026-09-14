@@ -188,17 +188,30 @@ def _find_icon(bgr, px, py, pw, ph, scales=(0.5, 0.65, 0.85, 1.0, 1.3, 1.7, 2.2)
     return best_pos, best_score
 
 
+def follow_features(region):
+    """跟随开合判定的三特征：返回 (content, fog, struct)。
+
+    content = 非暗像素占比(cls≠0)——仅日志展示，不参与判定（游戏画面亮度变化会误判，
+    2026-09-14 实测关态 Alt/F 特效 content 冲到 0.31 跨过旧阈值）；
+    fog    = FOG_BGR tol24 色距占比（关态 ≤0.002；重度探明开态可低至 0.001）；
+    struct = (cls2房间|cls3通路) 占比（开态 min 0.21 / 关态 max 0.017，主判据）。
+    判定规则在 ui/follow.py：fog ≥ FOLLOW_FOG_THRESH 或 struct ≥ FOLLOW_STRUCT_THRESH。
+    """
+    cls = classify_region(region)
+    content = float((cls != 0).mean())
+    fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24).mean())
+    struct = float(((cls == 2) | (cls == 3)).mean())
+    return content, fog, struct
+
+
 def map_is_open(shot_bgr, panel=FIXED_PANEL, icon_template=None):
     """地图是否打开：面板里须有「迷宫内容」（迷雾 或 通路/房间/墙 结构），而非一般游戏画面。
 
     大厅/游戏场景/结算界面 没有迷宫结构，应判为未打开。
-    返回 (bool, 迷宫内容占比)。
+    返回 (bool, 迷宫内容占比)。跟随的可靠判定请用 follow_features 双特征（见其注释）。
     """
     px, py, pw, ph = panel
     region = shot_bgr[py:py + ph, px:px + pw]
-    cls = classify_region(region)
-    fog = (cls == 4)
-    structure = ((cls == 1) | (cls == 2) | (cls == 3))
-    # 迷宫内容 = 迷雾 或 通路/房间/墙 结构（暗背景不算）
-    content = ((fog | structure)).astype(np.float32).mean()
+    content, _fog, _struct = follow_features(region)
     return content > 0.12, content
+

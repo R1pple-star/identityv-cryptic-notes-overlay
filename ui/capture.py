@@ -48,12 +48,24 @@ def get_window_rect(hwnd: int) -> Optional[tuple[int, int, int, int]]:
         return None
 
 
+# 常驻 mss 实例（懒初始化单例）。跟随轮询 250ms 一次，旧版每 tick `with mss.mss()`
+# 新建+销毁 DC 句柄，4次/秒的 GDI 开合循环会干扰英伟达截屏（2026-09-14 用户实测：
+# 软件常驻时 NVIDIA 截图失效，关软件才恢复）。所有调用都在 Qt 主线程，无线程问题。
+_SCT = None
+
+
+def _sct():
+    global _SCT
+    if _SCT is None:
+        import mss
+        _SCT = mss.mss()
+    return _SCT
+
+
 def capture_region(left: int, top: int, width: int, height: int) -> np.ndarray:
     """截取屏幕区域，返回 BGR ndarray（供 OpenCV 使用）。"""
-    import mss
     region = {"left": int(left), "top": int(top), "width": int(width), "height": int(height)}
-    with mss.mss() as sct:
-        img = sct.grab(region)
+    img = _sct().grab(region)
     # mss 返回 BGRA；转成 BGR
     bgra = np.asarray(img, dtype=np.uint8)
     return bgra[:, :, :3]
@@ -61,10 +73,8 @@ def capture_region(left: int, top: int, width: int, height: int) -> np.ndarray:
 
 def capture_monitor(index: int = 1) -> np.ndarray:
     """截取整个显示器，返回 BGR ndarray。index 从 1 开始（1=主显示器）。"""
-    import mss
-    with mss.mss() as sct:
-        mon = sct.monitors[index]
-        img = sct.grab(mon)
+    mon = _sct().monitors[index]
+    img = _sct().grab(mon)
     bgra = np.asarray(img, dtype=np.uint8)
     return bgra[:, :, :3]
 
