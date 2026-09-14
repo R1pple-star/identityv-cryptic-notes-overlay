@@ -72,6 +72,22 @@ SCORE_CONFIDENT = float(_CFG["match"]["score_confident"])
 ALIGN_SCORE_MAX = float(_CFG["match"]["align_score_max"])
 OVERLAP_MIN = float(_CFG["match"]["overlap_min"])
 SAMPLE_MASK_MIN = float(_CFG["match"]["sample_mask_min"])
+DOMINANT_CLS_MAX = float(_CFG["match"].get("dominant_cls_max", 0.90))
+# 扩大取样梯子（单类占比>DOMINANT_CLS_MAX 时依次尝试；只在当前档仍退化才降档）
+SAMPLE_LADDER = (0.25, 0.32)
+# 对齐失败居中兜底时，若样本单类占比仍高于此值 → 附「均匀区无锚点」说明
+DOMINANT_NOTE_MIN = 0.75
+
+
+def _dominant_frac(cls, mask):
+    """mask 内 {1,2,3} 最大单类占比。>DOMINANT_CLS_MAX = 样本退化为单一均匀区。"""
+    tot = max(1, int(mask.sum()))
+    return max(float(((cls == c) & (mask > 0)).sum()) / tot for c in (1, 2, 3))
+
+
+def _degenerate(res):
+    """多种子同分退化（sc<0.001 且与次名分差<0.001），与 _after_match 退化闸同款。"""
+    return len(res) >= 2 and res[0][0] < 0.001 and (res[1][0] - res[0][0]) < 0.001
 
 # 入口判别力降序：侧门/二楼房间形状各异（主要判别依据）；正门固定分不出种子。
 ENTRANCE_TYPES = ("侧门", "二楼", "正门")
@@ -367,7 +383,6 @@ class MainWindow(QWidget):
             return
         self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f}")
         sample = _crop_around_icon(shot, panel, icon_pos, self.settings.sample_half_frac)
-        self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
         # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
         # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
         _cls, smask, _w = build_sample_mask(sample)
@@ -376,6 +391,38 @@ class MainWindow(QWidget):
                            "请在刚进入口、周围已探明时再按", "WARN")
             self._log(et, [], icon_pos, isc, None, corrected=False)
             return
+        self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
+        dom = _dominant_frac(_cls, smask)
+        # 扩大取样梯子：单类占比过高 = 入口周围是单一均匀区（大片走廊/雾），分类
+        # SQDIFF「样本覆盖处类别全等」⇒ 多种子精确同分（2026-09-14 实测 98% cls3 →
+        # 种子2/18 同分 0.000）。扩大取样纳入更多结构可拉开分差（145440@0.25 →
+        # 种子2 0.0069 vs 次名 0.045）。只在「当前档仍退化」时降档、首个非退化即停
+        # ——0.32 档可能把并列翻成错误种子的假干净（实测 144715@0.32 翻成种子18）。
+        if dom > DOMINANT_CLS_MAX:
+            retried = False
+            for hf in SAMPLE_LADDER:
+                if res and not _degenerate(res):
+                    break
+                sample2 = _crop_around_icon(shot, panel, icon_pos, hf)
+                _cls2, smask2, _w2 = build_sample_mask(sample2)
+                if smask2.mean() < SAMPLE_MASK_MIN:
+                    continue  # 更大的框反而更空（罕见）：跳过该档
+                res2, _ip, _isc = find_seed_by_entrance(
+                    shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample2)
+                if not res2:
+                    continue
+                sample, res, _cls, smask, dom = (sample2, res2, _cls2, smask2,
+                                                 _dominant_frac(_cls2, smask2))
+                retried = True
+            self._show_sample_preview(sample)
+            if _degenerate(res):
+                self._log_step(
+                    f"样本单类占比{dom * 100:.0f}%（大片均匀走廊/未探明），扩大取样后仍无判别结构 → "
+                    "多探明周围结构后再按 / 手框含墙角结构的小块 / 3点标定", "WARN")
+                self._log(et, res, icon_pos, isc, None, corrected=False)
+                return
+            if retried:
+                self._log_step(f"扩大取样重试({sample.shape[1]}px)：单类降至{dom * 100:.0f}%，分差已拉开", "INFO")
         if not res:
             self._log_step("入口匹配无结果 → 手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
@@ -383,14 +430,20 @@ class MainWindow(QWidget):
         best = res[0]
         self._log_step(f"入口匹配: 种子{best[1]}({best[2]}[{best[3]}]) 分{best[0]:.3f} top3="
                        + str([(r[1], round(r[0], 3)) for r in res[:3]]), "OK")
-        self._after_match(shot, best, et, icon_pos, isc, res, corrected=False)
+        self._after_match(shot, best, et, icon_pos, isc, res, corrected=False, dom_frac=dom)
 
-    def _after_match(self, shot, best, et, icon_pos, isc, res, corrected=False):
-        """拿到 best 后：填 UI + 两段式对齐 + 投影 + 归档。供热键/手框样本复用。"""
+    def _after_match(self, shot, best, et, icon_pos, isc, res, corrected=False, dom_frac=None):
+        """拿到 best 后：填 UI + 两段式对齐 + 投影 + 归档。供热键/手框样本复用。
+
+        dom_frac: 匹配样本的单类占比（>DOMINANT_NOTE_MIN 且对齐失败时，居中兜底附
+        「均匀区无锚点」说明——种子ID可信但面板没有可对齐的结构，非对齐算法失灵。"""
         sc, seed, key, fl, _s, _mloc = best
-        # 退化防御：top1 与 top2 分差<0.001（多种子同分0.000）→ 样本退化/图标假阳，不假阳报告
-        if len(res) >= 2 and sc < 0.001 and (res[1][0] - sc) < 0.001:
-            self._log_step(f"匹配退化(多种子同分 {sc:.3f}) → 图标可能假阳/贴边，请手框样本或3点标定", "WARN")
+        corr_note = ("（面板为大段均匀区，无锚点可对齐——种子ID可信，地图居中仅供参考；"
+                     "精确重合请3点标定）" if (dom_frac is not None and dom_frac > DOMINANT_NOTE_MIN) else "")
+        # 退化防御：top1 与 top2 分差<0.001（多种子同分0.000）→ 样本无判别结构/图标假阳，不假阳报告
+        if _degenerate(res):
+            self._log_step(f"匹配退化(多种子同分 {sc:.3f}) → 样本无判别结构（均匀区/假阳图标），"
+                           "请手框含墙角结构的小块或3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=corrected)
             return
         if sc >= 1e8:  # 哨兵分兜底（find_seed_by_entrance 已跳过无尺度种子，此处防御）
@@ -424,9 +477,11 @@ class MainWindow(QWidget):
                     self._show_centered_if_any(seed, fl)
             else:
                 self._show_centered_if_any(seed, fl)
+                if corr_note:
+                    self._log_step("对齐不过闸，居中显示" + corr_note, "WARN")
         else:
             self._show_centered_if_any(seed, fl)
-            self._log_step("对齐失败(探明不足)，居中显示", "WARN")
+            self._log_step("对齐失败(探明不足)，居中显示" + corr_note, "WARN")
 
         confident = (sc < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
         self._log(et, res, icon_pos, isc, align, corrected=corrected)
@@ -523,6 +578,12 @@ class MainWindow(QWidget):
             self._log_step("手框取消", "INFO"); return
         x0, y0, x1, y1 = pk.rect
         sample = self._shot[y0:y1, x0:x1].copy()
+        # 尺度硬上限：SCALES_ENT 最小 0.6 × 引索裁图 228px = 380px，超限全尺度放不下
+        # → 各种子直接跳过、res 恒空（2026-09-14 实测手框 408px「仍无匹配」即此因）。
+        if max(sample.shape[:2]) > 380:
+            self._log_step(f"手框 {x1-x0}x{y1-y0} 超过380px（引索尺度下限 0.6×228）→ "
+                           "请框300px内、含墙角/房间边缘结构的区域", "WARN")
+            return
         self._show_sample_preview(sample)
         et = self.entrance_combo.currentText()
         self._log_step(f"手框样本 {x1-x0}x{y1-y0}，重跑匹配", "INFO")
@@ -537,7 +598,9 @@ class MainWindow(QWidget):
             return
         best = res[0]
         self._log_step(f"手框匹配: 种子{best[1]}({best[2]}[{best[3]}]) 分{best[0]:.3f}", "OK")
-        self._after_match(self._shot, best, et, icon_pos, isc, res, corrected=True)
+        _cls, smask, _w = build_sample_mask(sample)
+        self._after_match(self._shot, best, et, icon_pos, isc, res, corrected=True,
+                          dom_frac=_dominant_frac(_cls, smask))
 
     # ---- 投影显示 ----
     def _screen_size(self):

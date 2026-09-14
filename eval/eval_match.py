@@ -21,7 +21,10 @@ sys.path.insert(0, str(ROOT))
 import cv2  # noqa: E402
 
 from core.alignment import find_overlay_transform  # noqa: E402
-from core.entrance import build_entrance_transform, find_seed_by_entrance, load_index  # noqa: E402
+from core.entrance import (  # noqa: E402
+    _crop_around_icon, build_entrance_transform, build_sample_mask,
+    find_seed_by_entrance, load_index,
+)
 from core.map_library import MapLibrary  # noqa: E402
 from core.vision import load_bgr, panel_for_screen  # noqa: E402
 
@@ -32,7 +35,14 @@ MAP_DIR = _CFG["paths"]["map_library"]
 SCORE_CONFIDENT = float(_CFG["match"]["score_confident"])
 ALIGN_SCORE_MAX = float(_CFG["match"]["align_score_max"])
 OVERLAP_MIN = float(_CFG["match"]["overlap_min"])
+SAMPLE_MASK_MIN = float(_CFG["match"]["sample_mask_min"])
+DOMINANT_CLS_MAX = float(_CFG["match"].get("dominant_cls_max", 0.90))
 LABELS = ROOT / "eval" / "labels.csv"
+
+
+def _degen(res):
+    """与 app._degenerate 同款退化判定（多种子同分）。"""
+    return len(res) >= 2 and res[0][0] < 0.001 and (res[1][0] - res[0][0]) < 0.001
 
 
 def _align_overlap(shot, best, entrance_type, icon_pos, lib):
@@ -66,23 +76,56 @@ def load_labels():
     return rows
 
 
+def resolve_shot(fname: str):
+    """标注 file 依次在 shot_library / captures / eval/inbox 下找（captures 是运行时
+    截图、inbox 是失败回收，标注集三处都能指）。找不到返回 None。"""
+    for cand in (SHOT_DIR / fname, ROOT / "captures" / fname, ROOT / "eval" / "inbox" / fname):
+        if cand.exists():
+            return cand
+    return None
+
+
 def evaluate_sample(shot, lib, entrance_type, gt_seed):
-    """返回 dict: top3, best_seed, best_score, overlap, gate_pass, top1_correct, top3_correct。"""
+    """返回 dict: top3, best_seed, best_score, overlap, gate_pass, top1_correct, top3_correct, degenerate。"""
     panel = panel_for_screen(shot.shape[1], shot.shape[0])
     if panel is None:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
-                    gate_pass=False, top1_correct=False, top3_correct=False, icon=0.0)
+                    gate_pass=False, top1_correct=False, top3_correct=False, icon=0.0,
+                    degenerate=False)
     res, ip, isc = find_seed_by_entrance(shot, lib, entrance_type, panel=panel, top_n=3)
     if not res:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
-                    gate_pass=False, top1_correct=False, top3_correct=False, icon=isc)
+                    gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
+                    degenerate=False)
+    # 扩大取样梯子（与 app._entrance_pipeline_impl 保持同步）：单类占比>阈值且
+    # 当前档退化 → 0.25/0.32 重裁重匹配，首个非退化即停；全退化维持首档结果
+    # （下游闸自会拦，排名统计口径与不救时一致）。
+    if ip is not None:
+        cls, mask, _ = build_sample_mask(_crop_around_icon(shot, panel, ip, 0.18))
+        tot = int(mask.sum())
+        dom = (max(float(((cls == c) & (mask > 0)).sum()) / max(1, tot) for c in (1, 2, 3))
+               if tot > 0 else 1.0)
+        if dom > DOMINANT_CLS_MAX:
+            for hf in (0.25, 0.32):
+                if res and not _degen(res):
+                    break
+                crop = _crop_around_icon(shot, panel, ip, hf)
+                _c2, m2, _ = build_sample_mask(crop)
+                if m2.mean() < SAMPLE_MASK_MIN:
+                    continue
+                r2, _ip2, _isc2 = find_seed_by_entrance(
+                    shot, lib, entrance_type, panel=panel, top_n=3, sample_crop=crop)
+                if r2:
+                    res = r2
     best = res[0]
     top3 = [(r[1], r[0]) for r in res]
+    # 退化 = 多种子同分（app._after_match 同款闸：sc<0.001 且与次名分差<0.001）
+    degenerate = _degen(res)
     align = _align_overlap(shot, best, entrance_type, ip, lib)
     ov = align[2] if align else None
     gate = (best[0] < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
     return dict(top3=top3, best_seed=best[1], best_score=best[0], overlap=ov,
-                gate_pass=gate, icon=isc,
+                gate_pass=gate, icon=isc, degenerate=degenerate,
                 top1_correct=(best[1] == gt_seed),
                 top3_correct=(gt_seed in [r[1] for r in res]))
 
@@ -92,15 +135,16 @@ def main():
     lib = MapLibrary.load(MAP_DIR)
     rows = load_labels()
     print(f"标注集: {len(rows)} 张 (eval/labels.csv)\n")
-    hdr = f"{'file':<40}{'view':<5}{'et':<5}{'GT':<4}{'best':<5}{'分':<7}{'overlap':<8}{'闸':<3}{'top1':<5}{'top3'}"
+    hdr = (f"{'file':<40}{'view':<5}{'et':<5}{'GT':<4}{'best':<5}{'分':<7}"
+           f"{'overlap':<8}{'闸':<3}{'退':<3}{'top1':<5}{'top3'}")
     print(hdr); print("-" * len(hdr))
 
-    main_n = main_t1 = main_t3 = main_gate = 0
+    main_n = main_t1 = main_t3 = main_gate = main_deg = 0
     ctrl_n = ctrl_fp = 0
     for r in rows:
-        p = SHOT_DIR / r["file"]
-        if not p.exists():
-            print(f"{r['file']:<40}[跳过: 截图不存在]"); continue
+        p = resolve_shot(r["file"])
+        if p is None:
+            print(f"{r['file'][:40]:<40}[跳过: 截图不存在]"); continue
         shot = load_bgr(str(p))
         gt = int(r["seed"])
         et = r["entrance_type"]
@@ -110,22 +154,24 @@ def main():
         gate = "✓" if e["gate_pass"] else " "
         t1 = "✓" if e["top1_correct"] else "✗"
         t3 = "✓" if e["top3_correct"] else "✗"
+        deg = "!" if e["degenerate"] else " "
         ov_txt = f"{e['overlap']:.2f}" if e["overlap"] is not None else "-"
         sc_txt = f"{e['best_score']:.3f}" if e["best_score"] is not None else "-"
         print(f"{r['file'][:40]:<40}{view:<5}{et:<5}{gt:<4}{(e['best_seed'] or '-'):<5}"
-              f"{sc_txt:<7}{ov_txt:<8}{gate:<3}{t1:<5}{t3}")
+              f"{sc_txt:<7}{ov_txt:<8}{gate:<3}{deg:<3}{t1:<5}{t3}")
         if is_view:
             main_n += 1
             main_t1 += int(e["top1_correct"])
             main_t3 += int(e["top3_correct"])
             main_gate += int(e["gate_pass"])
+            main_deg += int(e["degenerate"])
         else:
             ctrl_n += 1
             ctrl_fp += int(e["gate_pass"])  # 控制组确信 = 误报
 
     print("-" * len(hdr))
     print(f"\n主集(刚进入口): top-1 {main_t1}/{main_n}  top-3 {main_t3}/{main_n}  "
-          f"overlap闸通过 {main_gate}/{main_n}")
+          f"overlap闸通过 {main_gate}/{main_n}  匹配退化 {main_deg}/{main_n}")
     fp_rate = (ctrl_fp / ctrl_n) if ctrl_n else 0
     print(f"控制组(非刚进入口): 误报率 {ctrl_fp}/{ctrl_n} = {fp_rate:.0%} "
           f"(确信=误报，应为0)")
