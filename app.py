@@ -504,16 +504,22 @@ class MainWindow(QWidget):
         if panel is None:
             self.status.setText("屏幕分辨率未适配（非16:9且未校准）——3点标定仍可用")
             return None
-        # 第一段：构造 M1 + 对齐尺度提示 hint_s（=入口匹配尺度 s）
+        # 第一段：构造 M1 + 对齐尺度提示 hint_s（=入口匹配尺度 s）+ 图标锚点 hint_icon
+        # （锚点约束第二段平移搜索——防自相似迷宫幽灵相位，见 find_overlay_transform 注）
         hint_s = None
+        hint_icon = None
         idx = load_index(seed)
         if idx is not None:
+            entry = idx.get(entrance_type)
+            if entry is not None:
+                hint_icon = (entry["cx"], entry["cy"], icon_pos[0], icon_pos[1])
             m1 = build_entrance_transform(best, entrance_type, idx, icon_pos, panel)
             if m1 is not None:
                 _M1, hint_s = m1
         # 第二段：hint 精修；过闸即用
-        if hint_s is not None:
-            align = find_overlay_transform(shot, ref, panel, hint_s=hint_s)
+        if hint_s is not None or hint_icon is not None:
+            align = find_overlay_transform(shot, ref, panel, hint_s=hint_s,
+                                           hint_icon=hint_icon)
             if align is not None:
                 _M, asc, ov = align
                 if asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN:

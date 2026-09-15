@@ -10,8 +10,8 @@ import cv2
 import numpy as np
 
 from core.map_library import MapLibrary
-from core.vision import load_bgr, panel_for_screen
-from core.entrance import find_seed_by_entrance, ENTRANCE_FLOOR
+from core.vision import load_bgr, panel_for_screen, _find_icon
+from core.entrance import find_seed_by_entrance, ENTRANCE_FLOOR, build_entrance_transform, load_index
 from core.alignment import find_overlay_transform
 
 MAP_DIR = r"D:\Pictures\20260818摸金地图"
@@ -51,7 +51,19 @@ def main():
         if info is None:
             print(f"  种子{mseed}/{mfl} 无参考图"); continue
         ref = load_bgr(str(info.path))
-        align = find_overlay_transform(shot, ref, panel)
+        # 生产同款两段式: 图标锚定优先(防幽灵相位), 不过闸回退全搜
+        align = None
+        icon_pos, _isc, _ik = _find_icon(shot, *panel)
+        idx = load_index(mseed)
+        if idx is not None and idx.get(et) is not None and icon_pos is not None:
+            hint_icon = (idx[et]["cx"], idx[et]["cy"], icon_pos[0], icon_pos[1])
+            m1 = build_entrance_transform(best, et, idx, icon_pos, panel)
+            a = find_overlay_transform(shot, ref, panel, hint_s=m1[1] if m1 else None,
+                                       hint_icon=hint_icon)
+            if a is not None and a[1] < 0.30 and a[2] >= 0.40:
+                align = a
+        if align is None:
+            align = find_overlay_transform(shot, ref, panel)
         if align is None:
             print(f"  重合: 探明不足，居中兜底"); continue
         M, sc, overlap = align

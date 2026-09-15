@@ -55,13 +55,17 @@ def _align_overlap(shot, best, entrance_type, icon_pos, lib):
     if panel is None:
         return None
     hint_s = None
+    hint_icon = None
     idx = load_index(best[1])
     if idx is not None:
+        entry = idx.get(entrance_type)
+        if entry is not None:
+            hint_icon = (entry["cx"], entry["cy"], icon_pos[0], icon_pos[1])
         m1 = build_entrance_transform(best, entrance_type, idx, icon_pos, panel)
         if m1 is not None:
             hint_s = m1[1]
-    if hint_s is not None:
-        a = find_overlay_transform(shot, ref, panel, hint_s=hint_s)
+    if hint_s is not None or hint_icon is not None:
+        a = find_overlay_transform(shot, ref, panel, hint_s=hint_s, hint_icon=hint_icon)
         if a is not None and a[1] < ALIGN_SCORE_MAX and a[2] >= OVERLAP_MIN:
             return a
     return find_overlay_transform(shot, ref, panel)

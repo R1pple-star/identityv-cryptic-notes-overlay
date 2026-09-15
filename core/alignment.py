@@ -35,6 +35,12 @@ ALIGN_SCALES = tuple(np.round(np.arange(0.30, 1.501, 0.05), 2))
 # int 取整可能让 tw>rw → 尺度被整体跳过、细搜可行域只剩单侧。坐标推导按 (cx0-PAD+ml) 补偿。
 PAD = 12
 
+# 图标锚点窗搜半径：hint_icon 给定时平移**钉死**在锚定位置(0=不搜平移，只搜尺度)。
+# 迷宫走廊网格自相似，填充 SQDIFF 景观极平——全图搜索锁进错位 146px 的「幽灵相位」
+# （分 0.046/overlap 0.80 双闸全过，2026-09-15 实测 17.13），窗搜给 4px 余量也会漂到
+# 次级幽灵(墙重合 60%→4%)。图标锚定+钉平移: score 0.046/ov 1.00/s 0.986/墙重合 60%。
+ANCHOR_RADIUS = 0
+
 
 def _revealed_mask(region, cls_r):
     """已探明真结构掩膜：分类为 墙/房/通路 且 **非迷雾**。
@@ -46,12 +52,15 @@ def _revealed_mask(region, cls_r):
     return (((cls_r == 1) | (cls_r == 2) | (cls_r == 3)) & (~fog)).astype(np.uint8)
 
 
-def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape):
+def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
+                    center=None, radius=0):
     """单尺度掩膜 SQDIFF 匹配。
 
-    返回 (score, ml_x, ml_y, res, msum) 或 None(尺度越界/掩膜太小)。
-    score = min(SQDIFF)/掩膜数，越小越匹配；ml_x/ml_y 为匹配左上角在 ref 内容里的整数位置。
-    """
+    返回 (score, ml_x, ml_y, res, msum, (off_x, off_y)) 或 None(尺度越界/掩膜太小)。
+    score = min(SQDIFF)/掩膜数，越小越匹配；ml_x/ml_y 为匹配左上角在 ref 内容里的
+    **全图**整数位置；res 为响应面（center 给定时是窗口局部坐标系，配 off 用）。
+    center: 图标锚定的模板左上角(ref坐标)——给定时平移只在该点 ±radius 邻域内搜
+    （防自相似迷宫的幽灵相位，见 ANCHOR_RADIUS 注）。"""
     tw, th = int(bw * s), int(bh * s)
     if tw < 10 or th < 10 or th > ref_shape[0] or tw > ref_shape[1]:
         return None
@@ -60,10 +69,25 @@ def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape):
     msum = float(tmk.sum())
     if msum < 50:
         return None
-    res = cv2.matchTemplate(ref_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
-                           mask=tmk.astype(np.float32))
+    off_x = off_y = 0
+    if center is None:
+        res = cv2.matchTemplate(ref_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
+                               mask=tmk.astype(np.float32))
+    else:
+        cx, cy = center
+        x0 = max(0, int(cx - radius))
+        y0 = max(0, int(cy - radius))
+        x1 = min(ref_shape[1], int(cx + tw + radius))
+        y1 = min(ref_shape[0], int(cy + th + radius))
+        if x1 - x0 < tw or y1 - y0 < th:
+            return None
+        if radius == 0 and (x0 != int(cx) or y0 != int(cy)):
+            return None   # 钉平移模式: 锚点出界该尺度直接跳过, 不许钳位漂移
+        res = cv2.matchTemplate(ref_f[y0:y1, x0:x1], tcl.astype(np.float32),
+                                cv2.TM_SQDIFF, mask=tmk.astype(np.float32))
+        off_x, off_y = x0, y0
     mn, _, _, ml = cv2.minMaxLoc(res)
-    return mn / msum, ml[0], ml[1], res, msum
+    return mn / msum, ml[0] + off_x, ml[1] + off_y, res, msum, (off_x, off_y)
 
 
 def _subpixel_min(res, mx, my):
@@ -88,7 +112,7 @@ def _subpixel_min(res, mx, my):
 
 
 def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SCALES,
-                           region=None, hint_s=None, fast=False):
+                           region=None, hint_s=None, hint_icon=None, fast=False):
     """求参考图→屏幕的最佳对齐变换 M(2x3)，使参考图与游戏内已探明结构重合。
 
     用迷雾剔除后的探明模板，对参考图(内容裁剪)做掩膜匹配，取最佳
@@ -97,6 +121,11 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
 
     region: 已裁好的面板 BGR(跟随循环只截面板区域时用)；None 则从 shot_bgr 按 panel 裁。
     hint_s: 上次对齐的尺度提示。给了就跳过 12 档粗搜，直接在 hint±0.06 细搜(省 ~0.4s)。
+    hint_icon: (ref_cx, ref_cy, screen_ix, screen_iy) 入口图标锚点四元组(M1 的核心)。
+            给定时平移搜索限制在锚定位置 ±ANCHOR_RADIUS 邻域，且粗搜全尺度窗扫——
+            迷宫走廊网格自相似，全图搜索可锁进错位 146px 的「幽灵相位」且双闸拦不住
+            (2026-09-15 实测 17.13：分 0.046/overlap 0.80 全过但墙重合仅 4%，
+            图标锚定后 67%)。图标是唯一无歧义锚点。
     fast:   只在 hint_s 单尺度匹配(平移跟踪用，~30ms；须与 hint_s 同给)。
             玩家平移地图不改尺度，单档即可拿到精确平移；缩放变了分会上来，由调用方降级。
 
@@ -138,15 +167,25 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     ref_f = ref_cls.astype(np.float32)
     ref_shape = ref_cls.shape
 
+    def _anchored_center(s):
+        """该尺度下图标锚定的模板左上角(ref 补边坐标系)。ref 补边坐标 = 原图-(cx0-PAD)，
+        图标坐标(cx,cy)是原图系 ⇒ 先折算。ref=(panel-t)·s 且图标钉死 ⇒
+        模板TL(bx0,by0)panel → (icx-(cx0-PAD))+(bx0-icon_panel)·s。"""
+        icx, icy, isx, isy = hint_icon
+        return (icx - (cx0 - PAD) + (bx0 - (isx - px)) * s,
+                icy - (cy0 - PAD) + (by0 - (isy - py)) * s)
+
     def _search(scale_list):
-        """在给定尺度列表上做掩膜匹配，返回最佳 (score,s,ml_x,ml_y,res,msum) 或 None。"""
+        """在给定尺度列表上做掩膜匹配，返回最佳 (score,s,ml_x,ml_y,res,msum,off) 或 None。"""
         best = None
         for s in scale_list:
-            r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape)
+            kw = ({"center": _anchored_center(float(s)), "radius": ANCHOR_RADIUS}
+                  if hint_icon is not None else {})
+            r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape, **kw)
             if r is None:
                 continue
             if best is None or r[0] < best[0]:
-                best = (r[0], s, r[1], r[2], r[3], r[4])
+                best = (r[0], s, r[1], r[2], r[3], r[4], r[5])
         return best
 
     s_lo, s_hi = float(scales[0]), float(scales[-1])
@@ -155,23 +194,26 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
         # 快速档：只在 hint_s 单尺度匹配(平移跟踪)。缩放变了分会上来，由调用方降级重搜。
         if hint_s is None:
             return None
-        r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape)
+        kw = ({"center": _anchored_center(float(hint_s)), "radius": ANCHOR_RADIUS}
+              if hint_icon is not None else {})
+        r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape, **kw)
         if r is None:
             return None
-        sc, s, ml_x, ml_y, res, _msum = r[0], float(hint_s), r[1], r[2], r[3], r[4]
+        sc, s, ml_x, ml_y, res, _msum, _off = r[0], float(hint_s), r[1], r[2], r[3], r[4], r[5]
     else:
-        if hint_s is None:
-            # 1) 粗搜(0.05 步)：定位真极小所在 basin
+        # 有图标锚点 → 粗搜也走窗搜且全尺度扫（入口匹配 s 与真实 s 可差 ~0.09，17.13
+        # 实测 0.9 vs 0.986——锚住平移后尺度交给全档扫描，别信 hint_s 的窄窗细搜）。
+        if hint_s is None or hint_icon is not None:
             coarse = _search(scales)
             if coarse is None:
                 return None
             s0 = coarse[1]
         else:
-            # 有尺度提示：跳过粗搜(跟随循环已知道上次尺度)
+            # 仅尺度提示(跟随循环已知道上次尺度)：跳过粗搜
             s0 = float(hint_s)
         # 2) 细搜(0.01 步，粗/hint 最优 ±0.06，覆盖 ±1.2 个粗档以避免落入局部极小)
         fine = _search(np.arange(max(s_lo, s0 - 0.06), min(s_hi, s0 + 0.06) + 1e-9, 0.01))
-        if hint_s is None:
+        if hint_s is None or hint_icon is not None:
             base = fine if (fine and fine[0] <= coarse[0]) else coarse
         else:
             base = fine
@@ -181,10 +223,11 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
         s1 = base[1]
         micro = _search(np.arange(max(s_lo, s1 - 0.012), min(s_hi, s1 + 0.012) + 1e-9, 0.002))
         best = micro if (micro and micro[0] <= base[0]) else base
-        sc, s, ml_x, ml_y, res, _msum = best
-    # 4) 亚像素位置：在微搜响应面上做二次曲线拟合(限幅 ±0.5 像元)
-    spx, spy = _subpixel_min(res, int(ml_x), int(ml_y))
-    ml_x, ml_y = spx, spy
+        sc, s, ml_x, ml_y, res, _msum, _off = best
+    # 4) 亚像素位置：在微搜响应面上做二次曲线拟合(限幅 ±0.5 像元)。
+    #    窗搜时 res 是窗口局部坐标，先减 off 拟合再加回。
+    spx, spy = _subpixel_min(res, int(ml_x - _off[0]), int(ml_y - _off[1]))
+    ml_x, ml_y = spx + _off[0], spy + _off[1]
 
     inv_s = 1.0 / s
     # ml 在补边坐标系里，内容原点 = (cx0-PAD, cy0-PAD)
