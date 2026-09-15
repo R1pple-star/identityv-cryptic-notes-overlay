@@ -15,7 +15,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from core.vision import FIXED_PANEL, FOG_BGR, classify_region, content_bbox
+from core.vision import (FIXED_PANEL, FOG_BGR, classify_region, content_bbox,
+                         walls_as_floors)
 
 
 # 尺度搜索：游戏内地图缩放随玩家平移/缩放而变，真实尺度常落在 0.7~0.85(面板适配)。
@@ -116,7 +117,7 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
         region = shot_bgr[py:py + ph, px:px + pw]
     if region is None or region.shape[0] < ph * 0.5 or region.shape[1] < pw * 0.5:
         return None  # 面板裁空(分辨率不符等)，不做无效匹配
-    cls_r = classify_region(region)
+    cls_r = walls_as_floors(classify_region(region), region)
     revealed = _revealed_mask(region, cls_r)
     if revealed.sum() < 300:
         return None
@@ -133,7 +134,7 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     # 补边放宽可行域；黑边 cls=0，掩膜像素不受影响。坐标推导按 (cx0-PAD+ml_x) 补偿。
     ref_c = cv2.copyMakeBorder(ref_bgr[cy0:cy0 + ch, cx0:cx0 + cw],
                                PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-    ref_cls = classify_region(ref_c)
+    ref_cls = walls_as_floors(classify_region(ref_c), ref_c)
     ref_f = ref_cls.astype(np.float32)
     ref_shape = ref_cls.shape
 

@@ -97,6 +97,37 @@ def load_bgr(path: str) -> np.ndarray:
 # 游戏内地图迷雾的颜色（BGR 顺序）。RGB(37,47,58) -> BGR(58,47,37)
 FOG_BGR = np.array([58, 47, 37], dtype=np.int16)
 
+# 墙色标定（2026-09-15 用户提供纯色块样本 D:\yanshi 实测，双侧均验证出墙线网络）：
+#   通路墙 BGR(138,119,111) 亮度119 冷-27（旧分类落 cls3=通路）
+#   房间墙 BGR(114,122,139) 亮度126 暖+25（旧分类落 cls2=房间）
+# 两墙中心相距55 → 并作一个墙类(拆两类会被交界带/抗锯齿跨侧翻转)；与最近地面色距≥99
+# → tol48 覆盖两墙交界带(距两心44/45)且不吞地面。拦截必须在 room/passage 判定之前。
+WALL_BGR = (np.array([138, 119, 111], dtype=np.int16),
+            np.array([114, 122, 139], dtype=np.int16))
+WALL_TOL = 48
+
+
+def walls_as_floors(cls, region):
+    """把 cls5(墙)按冷暖并回旧的 2/3/4/1 语义，供匹配两侧调用。
+
+    2026-09-15 实测(17.13 真对齐): 游戏内墙像素仅 6% 落参考墙线(66% 落通路), 反向 5%——
+    参考图(用户收集素材)与游戏内渲染的墙线位置不重合, 墙类进 SQDIFF 会重罚真种子
+    (重合 0.059→0.359, ±2px 容差带也救不回且更差 0.507)。并回旧语义后匹配与基线
+    逐位一致; cls5 保留给投影高亮/未来用游戏内渲染自采参考图后重启墙类实验。"""
+    out = cls.copy()
+    w5 = out == 5
+    if not w5.any():
+        return out
+    b = region[:, :, 0].astype(np.int16)
+    r = region[:, :, 2].astype(np.int16)
+    warm = r - b
+    gray = 0.114 * b + 0.587 * region[:, :, 1].astype(np.int16) + 0.299 * r
+    out[w5 & (warm > 12)] = 2
+    out[w5 & (warm < -10)] = 3
+    out[w5 & (out == 5) & (gray >= 85)] = 1   # 墙交界带(亮中性)——旧分类落 cls1 的那 0.2%
+    out[w5 & (out == 5)] = 4                   # 中性且暗——旧 fog 桶
+    return out
+
 
 def content_bbox(bgr_img: np.ndarray, thresh: int = 60) -> tuple[int, int, int, int]:
     """参考图里内容(迷宫)的包围盒，裁掉四周留白/边框。返回 (x0, y0, w, h)。"""
@@ -109,13 +140,15 @@ def content_bbox(bgr_img: np.ndarray, thresh: int = 60) -> tuple[int, int, int, 
 
 
 def classify_region(region):
-    """按 R-B 冷暖度 + 亮度分类。0=黑/无,1=墙,2=房间(暖/棕),3=通路(冷/蓝灰),4=迷雾(中性灰)。
+    """按 墙色距 + R-B 冷暖度 + 亮度 分类。0=黑/无,1=亮剩余,2=房间(暖/棕),3=通路(冷/蓝灰),4=迷雾(中性灰),5=墙。
 
-    颜色标定（来自用户标注参考图）:
+    颜色标定（来自用户标注参考图 + 2026-09-15 纯色块样本）:
       通路 RGB(76,82,100) R-B~-24  冷
       房间 RGB(109,96,87) R-B~+22  暖
       迷雾 RGB(70,70,76)  R-B~-6   中性
       黑   RGB(28,36,46)  亮度36   暗
+      通路墙 BGR(138,119,111) 亮度119 R-B~-27（色距判定，先于冷暖）
+      房间墙 BGR(114,122,139) 亮度126 R-B~+25（同上，与通路墙并作 cls5）
     """
     b = region[:, :, 0].astype(np.int16)
     r = region[:, :, 2].astype(np.int16)
@@ -125,11 +158,16 @@ def classify_region(region):
     cls = np.zeros(region.shape[:2], dtype=np.uint8)
     dark = gray < 42   # 真正的黑/空；雾(亮度45+)不算黑
     cls[dark] = 0
-    room = (~dark) & (warmth > 12)
+    # 墙色拦截（先于冷暖：通路墙冷-27 会落 cls3、房间墙暖+25 会落 cls2）
+    i16 = region.astype(np.int16)
+    wall = (~dark) & ((np.abs(i16 - WALL_BGR[0]).sum(axis=2) < WALL_TOL) |
+                      (np.abs(i16 - WALL_BGR[1]).sum(axis=2) < WALL_TOL))
+    cls[wall] = 5
+    room = (~dark) & (cls == 0) & (warmth > 12)
     cls[room] = 2
-    passage = (~dark) & (warmth < -10)
+    passage = (~dark) & (cls == 0) & (warmth < -10)
     cls[passage] = 3
-    fog = (~dark) & (np.abs(warmth) <= 12) & (gray < 85)
+    fog = (~dark) & (cls == 0) & (np.abs(warmth) <= 12) & (gray < 85)
     cls[fog] = 4
     cls[(~dark) & (cls == 0) & (gray >= 85)] = 1
     return cls
@@ -206,7 +244,7 @@ def follow_features(region):
     cls = classify_region(region)
     content = float((cls != 0).mean())
     fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24).mean())
-    struct = float(((cls == 2) | (cls == 3)).mean())
+    struct = float(((cls == 2) | (cls == 3) | (cls == 5)).mean())
     return content, fog, struct
 
 

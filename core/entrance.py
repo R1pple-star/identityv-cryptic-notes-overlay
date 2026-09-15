@@ -21,7 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.vision import FIXED_PANEL, FOG_BGR, _find_icon, classify_region, load_bgr
+from core.vision import (FIXED_PANEL, FOG_BGR, _find_icon, classify_region,
+                         load_bgr, walls_as_floors)
 
 ROOT = Path(__file__).resolve().parent.parent
 with open(ROOT / "config.toml", "rb") as _f:
@@ -95,7 +96,7 @@ def build_sample_mask(crop):
     空间相邻）。房间(cls2)亮度两侧都远离雾色、误判率最低→权重 _ROOM_W；
     通路(cls3)最易被渐变雾污染→降权 _PASS_W。参数见 config [match]。
     返回 (cls, mask_u8, weights_f32)。"""
-    cls = classify_region(crop)
+    cls = walls_as_floors(classify_region(crop), crop)
     fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
     if _FOG_DILATE > 0:
         fog = cv2.dilate(fog.astype(np.uint8),
@@ -135,7 +136,7 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         if not idx_path.exists():
             continue
         idx_bgr = load_bgr(str(idx_path))
-        idx_cls = classify_region(idx_bgr)
+        idx_cls = walls_as_floors(classify_region(idx_bgr), idx_bgr)
         idx_f = idx_cls.astype(np.float32)
         best_sc, best_s, best_mloc = 1e9, None, None
         for s in SCALES_ENT:
