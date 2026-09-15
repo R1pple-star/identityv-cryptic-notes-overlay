@@ -52,6 +52,12 @@ ICON_K_REF = float(_CFG["match"].get("icon_k_ref", 0.44))
 _FOG_DILATE = int(_CFG["match"].get("fog_dilate", 5))
 _ROOM_W = float(_CFG["match"].get("room_weight", 2.0))
 _PASS_W = float(_CFG["match"].get("passage_weight", 0.5))
+# 贴墙增益（模板侧软加权）：cls5 墙线 ±9px 带内像素权重 ×(1+wall_boost)，0=关(基线零扰动)。
+# 依据(2026-09-15 实测)：真走廊中位离墙 10-22px、雾 50-206px，但硬剔除「离墙>12px」会
+# 误杀 36-68% 真走廊(前沿雾侧墙不可见/宽走廊中心远/tol漏检暗墙段)——只能软加权不能剔。
+# 墙色雾免疫(雾最亮~75 < 墙带下沿~95)，贴墙像素=最不易被雾环污染的可靠结构。
+_WALL_BOOST = float(_CFG["match"].get("wall_boost", 0.0))
+_WALL_BAND = 9
 
 
 def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18, icon_k=None):
@@ -96,7 +102,9 @@ def build_sample_mask(crop):
     空间相邻）。房间(cls2)亮度两侧都远离雾色、误判率最低→权重 _ROOM_W；
     通路(cls3)最易被渐变雾污染→降权 _PASS_W。参数见 config [match]。
     返回 (cls, mask_u8, weights_f32)。"""
-    cls = walls_as_floors(classify_region(crop), crop)
+    cls_raw = classify_region(crop)
+    wall = cls_raw == 5
+    cls = walls_as_floors(cls_raw, crop)
     fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
     if _FOG_DILATE > 0:
         fog = cv2.dilate(fog.astype(np.uint8),
@@ -105,6 +113,10 @@ def build_sample_mask(crop):
     w = mask.astype(np.float32) * _PASS_W
     w[cls == 2] = _ROOM_W
     w[cls == 1] = 1.0
+    if _WALL_BOOST > 0 and wall.any():
+        near = cv2.dilate(wall.astype(np.uint8),
+                          np.ones((2 * _WALL_BAND + 1,) * 2, np.uint8)) > 0
+        w[near & (mask > 0)] *= (1.0 + _WALL_BOOST)
     return cls, mask, w
 
 
