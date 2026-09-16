@@ -7,7 +7,7 @@
 以及手动标定(affine_from_points) / 点变换(transform_point) / RGBA 悬浮层生成。
 
 搬家自 find_seed_submap.py（find_overlay_transform 及附属）与 matcher.py
-（affine_from_points/transform_point/map_to_overlay_rgba/auto_align_overlay），
+（affine_from_points/transform_point/map_to_overlay_rgba），
 纯移动、逻辑不变。PAD 由函数局部提为模块常量。
 """
 from __future__ import annotations
@@ -318,38 +318,3 @@ def map_to_overlay_rgba(map_path: str, M: np.ndarray, screen_w: int, screen_h: i
 
     rgba = np.dstack([warped[:, :, ::-1], alpha])  # BGR->RGB，再加 alpha
     return rgba
-
-
-def auto_align_overlay(ref_bgr: np.ndarray, panel, rotate: int = 0,
-                       wall_alpha: int = 160) -> np.ndarray:
-    """自动对齐：把参考图按 rotate 度旋转后，缩放到迷雾面板位置，生成悬浮层。
-
-    ref_bgr: 参考完整地图(BGR)
-    panel:   (x0, y0, w, h) 迷雾面板在屏幕上的位置
-    rotate:  0/90/180/270 度（参考图按「面向方向」命名，通常 0 即可）
-    返回 (rgba, (放置偏移x, 放置偏移y))
-    """
-    # 1. 裁掉参考图留白，只留迷宫内容
-    x0, y0, cw, ch = content_bbox(ref_bgr)
-    content = ref_bgr[y0:y0 + ch, x0:x0 + cw]
-
-    # 2. 旋转
-    if rotate == 90:
-        content = cv2.rotate(content, cv2.ROTATE_90_CLOCKWISE)
-    elif rotate == 180:
-        content = cv2.rotate(content, cv2.ROTATE_180)
-    elif rotate == 270:
-        content = cv2.rotate(content, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    # 3. 等比缩放到迷雾面板内（不拉伸，不裁剪）
-    px0, py0, pw, ph = panel
-    ch, cw = content.shape[:2]
-    scale = min(pw / cw, ph / ch) if (cw > 0 and ch > 0) else 1.0
-    nw, nh = int(cw * scale), int(ch * scale)
-    content = cv2.resize(content, (nw, nh), interpolation=cv2.INTER_LINEAR)
-
-    # 4. 生成 RGBA 悬浮层（背景透明，内容半透明），居中放入面板
-    gray = cv2.cvtColor(content, cv2.COLOR_BGR2GRAY)
-    alpha = np.where(gray > 55, wall_alpha, 0).astype(np.uint8)
-    rgba = np.dstack([content[:, :, ::-1], alpha])  # BGR->RGB + alpha
-    return rgba, (px0 + (pw - nw) // 2, py0 + (ph - nh) // 2)

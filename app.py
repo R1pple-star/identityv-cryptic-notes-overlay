@@ -22,7 +22,6 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-import numpy as np
 from PySide6.QtCore import Qt, QRect, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -31,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.alignment import (
-    affine_from_points, auto_align_overlay, find_overlay_transform, map_to_overlay_rgba,
+    affine_from_points, find_overlay_transform, map_to_overlay_rgba,
 )
 from core.entrance import (
     _crop_around_icon, sample_structure, build_entrance_transform, find_seed_by_entrance,
@@ -469,21 +468,18 @@ class MainWindow(QWidget):
             self._log_step(f"两段式对齐: 重合分{asc:.3f} 重叠{ov:.2f} "
                            + ("过闸✓" if show_ok else "不过闸"),
                            "OK" if show_ok else "WARN")
-            if show_ok:
-                info = self.lib.get(seed, fl)
-                if info is not None:
-                    rgba = map_to_overlay_rgba(str(info.path), align[0], *self._screen_size(), wall_alpha=self.settings.wall_alpha)
-                    self._show_overlay(rgba)
-                    self._log_step("投影已显示", "OK")
-                else:
-                    self._show_centered_if_any(seed, fl)
+        if show_ok:
+            info = self.lib.get(seed, fl)
+            if info is not None:
+                rgba = map_to_overlay_rgba(str(info.path), align[0], *self._screen_size(), wall_alpha=self.settings.wall_alpha)
+                self._show_overlay(rgba)
+                self._log_step("投影已显示", "OK")
             else:
-                self._show_centered_if_any(seed, fl)
-                if corr_note:
-                    self._log_step("对齐不过闸，居中显示" + corr_note, "WARN")
+                self._refuse(f"种子{seed}({key}[{fl}])", f"引索里没有该种子的 {fl} 参考图")
         else:
-            self._show_centered_if_any(seed, fl)
-            self._log_step("对齐失败(探明不足)，居中显示" + corr_note, "WARN")
+            why = (f"对齐没过显示闸(重合{asc:.3f} 重叠{ov:.2f})" if align is not None
+                   else "对齐失败(探明不足)")
+            self._refuse(f"种子{seed}({key}[{fl}])", why + corr_note)
 
         confident = (sc < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
         self._log(et, res, icon_pos, isc, align, corrected=corrected)
@@ -491,7 +487,8 @@ class MainWindow(QWidget):
         self.status.setText(
             f"入口{et}(图标{isc:.2f}) {score_desc(sc)} 重叠{ov_txt} → 种子{seed}({key}[{fl}])"
             + (" ✓确信已对齐" if (confident and show_ok)
-               else " 不确信，可手动改门/3点标定"))
+               else (" 种子可信但未对齐（未投影）" if confident
+                     else " 不确信，可手动改门/3点标定")))
 
     def _two_stage_align(self, shot, best, entrance_type, icon_pos):
         """两段式对齐：第一段 M1(入口图标对应+匹配尺度) → 第二段 find_overlay_transform(hint_s) 精修；
@@ -549,9 +546,8 @@ class MainWindow(QWidget):
             self.status.setText(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
             self._log_step(f"手动重对齐: {info.key} 重合{asc:.2f} 重叠{ov:.2f} 已投影", "OK")
         else:
-            self._show_centered(ref)
-            self.status.setText(f"对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})，居中显示：{info.key}")
-            self._log_step(f"手动重对齐不可靠(重合{asc:.2f} 重叠{ov:.2f})，居中显示 {info.key}", "WARN")
+            self._refuse(info.key, f"手动重对齐没过闸(重合{asc:.2f} 重叠{ov:.2f})")
+            self.status.setText(f"未投影：对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})｜{info.key}")
 
     def _three_point_calib(self):
         """手动兜底：3 点标定（affine_from_points，3 下点击必对）。
@@ -641,27 +637,20 @@ class MainWindow(QWidget):
         self.preview.set_sample(bgr)
         self.preview.show()
 
-    def _show_centered(self, ref):
-        sw, sh = self._screen_size()  # _screen_size 返回 (width, height)
-        panel = panel_for_screen(sw, sh)
-        if panel is None:  # 未适配分辨率：居中 75% 屏兜底，位置仅供人眼看
-            panel = (sw // 8, sh // 8, sw * 3 // 4, sh * 3 // 4)
-        rgba, (ox, oy) = auto_align_overlay(ref, panel, rotate=0)
-        rh, rw = rgba.shape[:2]
-        x0, y0 = max(0, ox), max(0, oy)
-        x1, y1 = min(sw, ox + rw), min(sh, oy + rh)
-        if x1 <= x0 or y1 <= y0:
-            # 地图超出屏幕(屏幕非1920x1080/缩放/面板坐标不符)：直接显示不贴位
-            self._show_overlay(rgba)
-            return
-        full = np.zeros((sh, sw, 4), dtype=np.uint8)  # (height, width, 4)
-        full[y0:y1, x0:x1] = rgba[y0 - oy:y1 - oy, x0 - ox:x1 - ox]
-        self._show_overlay(full)
+    def _refuse(self, label, why):
+        """不确信 / 对齐没过闸 ⇒ **一张图都不显示**（待办 1，2026-09-16 晚）。
 
-    def _show_centered_if_any(self, seed, floor):
-        info = self.lib.get(seed, floor)
-        if info is not None:
-            self._show_centered(load_bgr(str(info.path)))
+        旧行为是 `_show_centered_if_any` → `auto_align_overlay` 把参考图按
+        `min(pw/cw, ph/ch)` **缩放铺满迷雾面板**：比例与游戏内毫无关系，却画得工整、
+        结构清楚，看起来就像一张"已经对齐好的地图"—— 用户报的「乱给一张素材、
+        比例都不对」就是它，不是对齐结果。宁可什么都不给，也不给一张像是对的的假图：
+        假图会让人以为算法定位到了别处，比空白有害得多。
+
+        种子ID仍写进状态栏与日志（那个数是有意义的）；想看参考图请显式用
+        「▶ 按此种子对齐」（全搜）或「✋ 手动选点重合」（3 点标定）。
+        """
+        self._set_overlay_visible(False)
+        self._log_step(f"不投影：{why}｜入口判定 {label}（位置未验证，仅供参考）", "WARN")
 
     def _hide_overlay(self):
         if self.overlay is None:
