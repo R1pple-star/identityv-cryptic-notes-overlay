@@ -34,7 +34,7 @@ from core.alignment import (
     affine_from_points, auto_align_overlay, find_overlay_transform, map_to_overlay_rgba,
 )
 from core.entrance import (
-    _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance,
+    _crop_around_icon, sample_structure, build_entrance_transform, find_seed_by_entrance,
     load_index, score_desc,
 )
 from core.map_library import MapLibrary
@@ -387,7 +387,7 @@ class MainWindow(QWidget):
                                    icon_k=icon_k)
         # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
         # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
-        _cls, smask, _w = build_sample_mask(sample)
+        _cls, smask = sample_structure(sample)
         if smask.mean() < SAMPLE_MASK_MIN:
             self._log_step(f"样本结构仅{smask.mean() * 100:.0f}%（入口周围未探明）→ "
                            "请在刚进入口、周围已探明时再按", "WARN")
@@ -406,7 +406,7 @@ class MainWindow(QWidget):
                 if res and not _degenerate(res):
                     break
                 sample2 = _crop_around_icon(shot, panel, icon_pos, hf, icon_k=icon_k)
-                _cls2, smask2, _w2 = build_sample_mask(sample2)
+                _cls2, smask2 = sample_structure(sample2)
                 if smask2.mean() < SAMPLE_MASK_MIN:
                     continue  # 更大的框反而更空（罕见）：跳过该档
                 res2, _ip, _isc, _ik = find_seed_by_entrance(
@@ -608,7 +608,7 @@ class MainWindow(QWidget):
             return
         best = res[0]
         self._log_step(f"手框匹配: 种子{best[1]}({best[2]}[{best[3]}]) 分{best[0]:.3f}", "OK")
-        _cls, smask, _w = build_sample_mask(sample)
+        _cls, smask = sample_structure(sample)
         self._after_match(self._shot, best, et, icon_pos, isc, res, corrected=True,
                           dom_frac=_dominant_frac(_cls, smask))
 

@@ -21,8 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.vision import (FIXED_PANEL, FOG_BGR, MATCH_METRIC, _find_icon, classify_region,
-                         consistent_cost, load_bgr, to_match3, walls_as_floors)
+from core.vision import (FIXED_PANEL, FOG_BGR, _find_icon, classify_region,
+                         load_bgr, walls_as_floors)
 
 ROOT = Path(__file__).resolve().parent.parent
 with open(ROOT / "config.toml", "rb") as _f:
@@ -47,37 +47,24 @@ MIN_TEMPLATE_PX = 150
 # 不了缩放——缩放只有这条 ruler 路径；只放大不缩小，缩小会让小模板假获胜（17.13 实测
 # 纯 ruler 缩到 186px → 错种子 0.031 反超）。
 ICON_K_REF = float(_CFG["match"].get("icon_k_ref", 0.44))
-# 渐变迷雾剔除 + 房间加权（config [match]；迷雾是渐变色，仅 tol24 精确色剔不净外圈，
-# 膨胀雾核一并剔；房间亮度两侧都远离雾色、误判率最低→加权，通路易被雾污染→降权）
+# 渐变迷雾剔除：迷雾是渐变色，tol24 精确色只剔得净雾核，渐变外圈会被判成通路
+# 污染掩膜 —— 故把雾核膨胀 _FOG_DILATE px 一并剔（渐变段与雾核空间相邻）。
+# 该掩膜现只用于**快速失败闸**（样本结构占比 < sample_mask_min 即拒答）与单类退化检测；
+# 入口排序本身走墙重合度量，不吃这张掩膜。
 _FOG_DILATE = int(_CFG["match"].get("fog_dilate", 5))
-_ROOM_W = float(_CFG["match"].get("room_weight", 2.0))
-_PASS_W = float(_CFG["match"].get("passage_weight", 0.5))
-# 贴墙增益（模板侧软加权）：cls5 墙线 ±9px 带内像素权重 ×(1+wall_boost)，0=关(基线零扰动)。
-# 依据(2026-09-15 实测)：真走廊中位离墙 10-22px、雾 50-206px，但硬剔除「离墙>12px」会
-# 误杀 36-68% 真走廊(前沿雾侧墙不可见/宽走廊中心远/tol漏检暗墙段)——只能软加权不能剔。
-# 墙色雾免疫(雾最亮~75 < 墙带下沿~95)，贴墙像素=最不易被雾环污染的可靠结构。
-_WALL_BOOST = float(_CFG["match"].get("wall_boost", 0.0))
-_WALL_BAND = 9
 # 图标锚定（2026-09-15 上线）：样本图标 ↔ 引索图标重合后**钉死平移只搜尺度**，尺度由
 # 「图标当尺子」定 s0 = r_fine/k（两侧对同一模板 assets/_icon_entrance.png 做 NCC；k 由
-# _find_icon 细网格量，r_fine 由引索侧细网格量、存 json 的 scale_fine）。±_ANCHOR_BAND
-# 细修兜 s0 的量化误差。依据 experiments/e5_anchor_ab.py 的 2×2 实测：引索窗口放大到 2×
-# 后**全搜会炸**（主集 top-1 3/3→2/3、控制组低分确信 1→5——搜索域变大=自相似错位有机
-# 可乘），锚定把它抹平回 3/3 与 1，且控制组真种子排名由 7~24 名提到 1~7 名。
-# 关掉（false）→ 回「全搜 + 原 SCALES_ENT」，零扰动回滚。
+# _find_icon 细网格量，r_fine 由引索侧细网格量、存 json 的 scale_fine）。依据
+# experiments/e5_anchor_ab.py 的 2×2 实测：引索窗口放大到 2× 后**全搜会炸**（主集 top-1
+# 3/3→2/3、控制组低分确信 1→5——搜索域变大=自相似错位有机可乘），锚定把它抹平回 3/3 与 1，
+# 且控制组真种子排名由 7~24 名提到 1~7 名。关掉（false）→ 该口径无锚点即全体弃权。
 _ANCHOR_PIN = bool(_CFG["match"].get("anchor_pin", False))
 # _ANCHOR_BAND/_ANCHOR_STEP/_ANCHOR_N（尺度窄带 s0±0.06）已废弃：s0=r_fine/k 的残差是 ~0.09
 # 量级，窄带兜不住（2026-09-16 实测把 17.11 真种子18 挤成种子15）。锚定现在只钉平移、
-# 尺度走全域 SCALES_ENT。config 的 [match].anchor_band 保留但不再被读。
-# 匹配口径（config [match] metric，见 core/vision.MATCH_METRIC）：
-#   "consistency" = 错配率（新）——5 类嵌 R^4 正单纯形，4 通道 SQDIFF /(2·权重和)；
-#   "sqdiff"      = 旧「类号平方差」，逐位回滚用。原理与实测见 core/vision.py 长注。
-_METRIC = MATCH_METRIC
-# 入口层用哪个分排序（config [match] entrance_metric）：
-#   "wall"（新，推荐）= 墙双向覆盖率取负（见下方"墙重合度量"长注），需锚点，无锚点即弃权；
-#   "class"          = 5 类错配率（现状）。两者都归一到"越小越好"，故排序/闸门语义不变；
-# 但**量纲不同**：换它必须同改 [match] score_confident（class 0.22 ↔ wall 0.45，见 config 注释）。
-_ENTRANCE_METRIC = str(_CFG["match"].get("entrance_metric", "class"))
+# 尺度走全域 SCALES_ENT。config 的 [match].anchor_band 已删。
+#
+# 入口层口径：**墙重合度量**（唯一口径，见下方长注）。旧的「5 类错配率」class 档与
+# 「类号平方差」sqdiff 档已于 2026-09-16 连同 `_scan_seed` 一起删除 —— 回滚走 git。
 
 
 def _crop_box(panel, icon_pos, half_frac=0.18, icon_k=None):
@@ -124,33 +111,27 @@ def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18, icon_k=None):
     return region[y0:y0 + side, x0:x0 + side].copy()
 
 
-def build_sample_mask(crop):
-    """样本分类 mask：迷雾(含渐变外圈)剔除 + 房间/通路加权。
+def sample_structure(crop):
+    """样本的「探明结构」掩膜：迷雾(含渐变外圈)剔除后的墙/房/通路。
 
     迷雾是渐变色：tol24 精确色只剔得掉雾核，渐变外圈会被 classify_region 判成
     通路(cls3) 污染 mask——故把雾核膨胀 _FOG_DILATE px 一并剔除（渐变段与雾核
-    空间相邻）。房间(cls2)亮度两侧都远离雾色、误判率最低→权重 _ROOM_W；
-    通路(cls3)最易被渐变雾污染→降权 _PASS_W。参数见 config [match]。
-    返回 (cls, mask_u8, weights_f32)。"""
+    空间相邻）。参数见 config [match]。
+
+    返回 (cls, mask_u8)。**不再回传权重**：权重原本只喂入口层的 class 口径
+    （贴墙增益/房间加权），该口径 2026-09-16 已随 `_scan_seed` 一起删除；入口排序
+    现在走墙重合度量，只吃两侧的墙掩膜（classify_region(...)==5）。"""
     cls_raw = classify_region(crop)
-    wall = cls_raw == 5
     cls = walls_as_floors(cls_raw, crop)
     fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
     if _FOG_DILATE > 0:
         fog = cv2.dilate(fog.astype(np.uint8),
                          np.ones((_FOG_DILATE, _FOG_DILATE), np.uint8)) > 0
     mask = (((cls == 1) | (cls == 2) | (cls == 3)) & (~fog)).astype(np.uint8)
-    w = mask.astype(np.float32) * _PASS_W
-    w[cls == 2] = _ROOM_W
-    w[cls == 1] = 1.0
-    if _WALL_BOOST > 0 and wall.any():
-        near = cv2.dilate(wall.astype(np.uint8),
-                          np.ones((2 * _WALL_BAND + 1,) * 2, np.uint8)) > 0
-        w[near & (mask > 0)] *= (1.0 + _WALL_BOOST)
-    return cls, mask, w
+    return cls, mask
 
 
-# ===== 墙重合度量（2026-09-16 用户提议，`[match] entrance_metric = "wall"`）=====
+# ===== 墙重合度量（2026-09-16 用户提议，入口层**唯一**口径）=====
 # 动机：5 类标签的"错配率"在大片均匀区（长走廊/大房间）没有判别力 —— 那里挪 40px 还是
 # "全一致"，正是入口样本最常见的形态；而"墙"是 1-9px 的细线，一挪就错开。
 # 做法（只比几何，不比色块）：
@@ -210,55 +191,6 @@ def _scan_seed_wall(game_wall, ref_wall, scales, anchor, icon_off):
     return best
 
 
-def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
-    """在某种子的引索裁图上扫 `scales`，返回 (最优分, 获胜尺度, mloc)。分越小越匹配。
-
-    anchor=(rx, ry, s0) 非 None → **图标锚定档**：引索图标在裁图内偏移 (rx,ry) 与样本图标
-    在裁样内偏移 icon_off 重合，模板落点唯一确定 ⇒ 只读分图上那一个位置 res[ay,ax]，
-    **不平移搜索**（治自相似错位＝幽灵相位）。锚点出界 → 该尺度跳过，不许钳位漂移
-    （同 core/alignment.py ANCHOR_RADIUS=0 的做法）。anchor=None → 全搜 minMaxLoc。
-    两种取法读的是**同一张 matchTemplate 分图**，归一分母同为 wsum，故公式逐位可比。
-    """
-    best = (1e9, None, None)
-    in_h, in_wd = in_cls.shape[:2]
-    # 新口径：引索侧 one-hot（每种子一次，尺度循环内复用）。
-    idx_oh = to_match3(idx_cls) if _METRIC == "consistency" else None
-    for s in scales:
-        tw, th = int(in_wd * s), int(in_h * s)
-        if tw < 10 or th < 10 or th > idx_cls.shape[0] or tw > idx_cls.shape[1]:
-            continue
-        if min(tw, th) < MIN_TEMPLATE_PX:  # 防小模板假获胜（见常量注释）
-            continue
-        tcl = cv2.resize(in_cls, (tw, th), interpolation=cv2.INTER_NEAREST)
-        tmk = cv2.resize(in_w, (tw, th), interpolation=cv2.INTER_NEAREST)
-        wsum = float(tmk.sum())
-        if wsum < 50:
-            continue
-        tmk_f = tmk.astype(np.float32)
-        if _METRIC == "consistency":
-            # 数"一致"（见 vision.to_match3 长注）：CCORR 无 mask ⇒ FFT 快路；掩膜折进模板
-            # （掩膜外填 0）。相减后仍是"越小越匹配"的代价图，故下游取 min 的逻辑不变。
-            res = consistent_cost(idx_oh, to_match3(tcl) * tmk_f[..., None], wsum)
-        else:
-            res = cv2.matchTemplate(idx_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
-                                    mask=tmk_f)
-        div = wsum
-        if anchor is not None:
-            rx, ry, _s0 = anchor
-            ax = int(round(rx - icon_off[0] * (tw / in_wd)))
-            ay = int(round(ry - icon_off[1] * (th / in_h)))
-            if not (0 <= ax < res.shape[1] and 0 <= ay < res.shape[0]):
-                continue   # 锚点出界：该尺度跳过，不许钳位漂移（与对齐层 ANCHOR_RADIUS=0 同规）
-            sc, ml = float(res[ay, ax]) / div, (ax, ay)
-        else:
-            # ⚠️ 顺序是 (minVal, maxVal, minLoc, maxLoc)：minLoc 是第 3 个。原写作
-            # `mn, _, _, ml =` 取到的是 maxLoc（与 min 分数不配套），同 alignment 那处 bug。
-            mn, _, ml, _ = cv2.minMaxLoc(res)   # §3.1：取 argmin 位置
-            sc, ml = float(mn) / div, (int(ml[0]), int(ml[1]))
-        if sc < best[0]:
-            best = (sc, s, ml)
-    return best
-
 
 def find_seed_by_entrance(shot, lib, entrance_type: str,
                           index_dir=ENTRANCE_INDEX_DIR, panel=FIXED_PANEL,
@@ -281,11 +213,11 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         return [], None, 0.0, None
     in_crop = sample_crop if sample_crop is not None else _crop_around_icon(
         shot, panel, icon_pos, icon_k=icon_k)
-    in_cls, in_mask, in_w = build_sample_mask(in_crop)
+    _in_cls, in_mask = sample_structure(in_crop)
     if in_mask.sum() < 100:
         return [], icon_pos, icon_score, icon_k
-    # 墙重合档：样本侧墙掩膜（各自 classify 一次；build_sample_mask 只回 cls/权重，不含墙）
-    game_wall = (classify_region(in_crop) == 5) if _ENTRANCE_METRIC == "wall" else None
+    # 样本侧墙掩膜（雾免疫：雾最亮~75 < 墙带下沿~95，故"有墙 ⇒ 已探明"严格成立）
+    game_wall = classify_region(in_crop) == 5
 
     fl = ENTRANCE_FLOOR[entrance_type]
     # 样本图标在样本内的偏移（屏幕px）——锚定档的平移基准。手框路径同样要算（见下面注释）。
@@ -306,43 +238,25 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         if not idx_path.exists():
             continue
         idx_bgr = load_bgr(str(idx_path))
-        idx_raw = classify_region(idx_bgr)
-        idx_cls = walls_as_floors(idx_raw, idx_bgr)
-        idx_f = idx_cls.astype(np.float32)
-        ref_wall = (idx_raw == 5) if _ENTRANCE_METRIC == "wall" else None
+        ref_wall = classify_region(idx_bgr) == 5
 
-        # 锚定档参数：引索图标在裁图内偏移(rx,ry) + 图标当尺子定尺度 s0 = r_fine/k。
+        # 锚点 = 引索图标在裁图内的偏移 (rx,ry)。尺度**不再**由 r_fine/k 提示：窄带口径
+        # 废弃后尺度走全域 SCALES_ENT，锚定只负责钉死平移。
         anchor = None
-        if _ANCHOR_PIN and icon_off is not None and icon_k:
+        if _ANCHOR_PIN and icon_off is not None:
             js = load_index(seed, index_dir)
             ent = js.get(entrance_type) if js else None
             if ent and "box" in ent:
-                r_fine = float(ent.get("scale_fine", ent["scale"]))
-                anchor = (ent["cx"] - ent["box"][0], ent["cy"] - ent["box"][1],
-                          r_fine / icon_k)
+                anchor = (ent["cx"] - ent["box"][0], ent["cy"] - ent["box"][1])
 
-        if _ENTRANCE_METRIC == "wall":
-            # 墙重合档：**必须锚定** —— 无锚点则该种子弃权（不回退全搜，统计量不同不可比）
-            best_sc, best_s, best_mloc = (
-                _scan_seed_wall(game_wall, ref_wall, SCALES_ENT, anchor, icon_off)
-                if anchor is not None else (1e9, None, None))
-        elif anchor is not None:
-            # 锚定档：钉死平移（治自相似幽灵相位），尺度仍走全域 SCALES_ENT —— 与
-            # core/alignment.py 的 hint_icon 同哲学（那里注释：锚住平移后尺度交给全档扫描）。
-            # 尺度窄带（s0±_ANCHOR_BAND）已废弃：s0=r_fine/k 的残差是 ~0.09 量级，窄带兜不住，
-            # 2026-09-16 实测它把 17.11 的真种子18 挤成种子15。
-            #
-            # **锚点出界 = 该种子弃权，不回退全搜**（2026-09-16 修）：先前写法是"本种子锚定
-            # 一档都没落下 → 偷偷换成全搜"，而全搜取的是每个尺度的全局最小、恒 ≤ 锚点那一点的
-            # 值 —— 于是"锚点用不了的种子"自动获得更宽的自由度，靠不公平的优势压过真种子
-            # （17.11：种子15 锚点 0/13 档可用 → 回退全搜得 0.109，以 0.005 之差赢了种子18 的
-            # 锚定值 0.114）。这与 CLAUDE.md 对齐层记的"锚定取分单调只升不降"是同一个病。
-            # 公平做法：同一统计量才可比 —— 锚点不可用就不参与排名。
-            best_sc, best_s, best_mloc = _scan_seed(in_cls, in_w, idx_cls, idx_f,
-                                                    SCALES_ENT, anchor, icon_off)
-        else:
-            best_sc, best_s, best_mloc = _scan_seed(in_cls, in_w, idx_cls, idx_f,
-                                                    SCALES_ENT, None, None)
+        # **必须锚定**：墙重合只在锚点处评一次。无锚点 = 该种子弃权，绝不回退全搜 ——
+        # 全搜取的是每个尺度的全局最小、恒 ≤ 锚点那一点的值，于是"锚点用不了的种子"白拿
+        # 更宽的自由度，靠不公平优势压过真种子（17.11 实测：种子15 锚点 0/13 档可用，
+        # 回退全搜得 0.109，以 0.005 之差翻掉真种子18 的锚定值 0.114）。统计量不同就不可比；
+        # 锚点不可用就不参与排名。这同时是治自相似「幽灵相位」的唯一无歧义约束。
+        best_sc, best_s, best_mloc = (
+            _scan_seed_wall(game_wall, ref_wall, SCALES_ENT, anchor, icon_off)
+            if anchor is not None else (1e9, None, None))
         info = lib.get(seed, "一楼")
         if best_s is None:
             # 无任何尺度放得下（样本大于该种子引索裁图，如手框过大）：不计入。
@@ -355,14 +269,10 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
 
 
 def score_desc(score) -> str:
-    """把入口分翻译成人话，供 UI 日志/状态栏。分越小越好，但含义随口径变。"""
+    """把入口分翻译成人话，供 UI 日志/状态栏。分 = 1 − 墙双向覆盖率，越小越好。"""
     if score is None:
         return "-"
-    if _ENTRANCE_METRIC == "wall":
-        return f"墙重合{max(0.0, 1.0 - score):.0%}"
-    if _METRIC == "consistency":
-        return f"错配{score:.0%}"
-    return f"分{score:.3f}"
+    return f"墙重合{max(0.0, 1.0 - score):.0%}"
 
 
 def load_index(seed: int, index_dir=ENTRANCE_INDEX_DIR) -> dict | None:

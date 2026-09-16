@@ -27,7 +27,6 @@ def _load_config():
     defaults = {
         "panel_rect": (668, 166, 1064, 569),
         "icon_template": "_icon_entrance.png",
-        "metric": "sqdiff",
     }
     try:
         with open(_CONFIG_PATH, "rb") as f:
@@ -37,7 +36,6 @@ def _load_config():
         defaults["panel_rects"] = {k: tuple(v)
                                    for k, v in cfg["panel"].get("rects", {}).items()}
         defaults["icon_template"] = cfg["paths"]["icon_template"]
-        defaults["metric"] = cfg["match"].get("metric", "sqdiff")
     except Exception:
         pass
     return defaults
@@ -49,9 +47,9 @@ _CFG = _load_config()
 # 其它分辨率经 panel_for_screen 等比外推或查 config [panel.rects] 校准表。
 FIXED_PANEL = _CFG["panel_rect"]
 _PANEL_REF_RES = _CFG["panel_res"]
-# 匹配口径（config [match] metric）："consistency" = 错配率（新）/ "sqdiff" = 类号平方差（旧）。
-# 入口引索匹配与投影重合两侧共用此开关；原理、实测与代价见 simplex5 长注。
-MATCH_METRIC = str(_CFG.get("metric", "sqdiff"))
+# 匹配口径：**只有一种** —— 「错配率」（5 类嵌 R^4 正单纯形 / 数一致 CCORR，见 to_match3 长注）。
+# 旧的「类号平方差」sqdiff 已于 2026-09-16 删除（它的病理见 CLAUDE.md 技术备忘①：
+# 惩罚=(类号差)² 纯属编号巧合，真对齐算成 0.47~2.56 永远过不了闸）。要回滚请走 git。
 
 
 def panel_for_screen(w: int, h: int):
@@ -118,7 +116,8 @@ def walls_as_floors(cls, region):
     墙类不进 SQDIFF 的死因是厚度惩罚(游戏内墙5-9px vs 参考墙1-3px, 直进重合分
     0.046→1.31, 参考侧膨胀也救不回)——两侧墙线画位在图标锚定下重合 60-67%(素材与
     游戏内同渲染器, 早先"画位不重合"系幽灵相位误判, 见 CLAUDE.md)。并回旧语义后
-    匹配与基线逐位一致; cls5 保留给贴墙增益(wall_boost)/投影高亮等用途。"""
+    对齐层匹配与基线逐位一致; **cls5 原样保留**，现由入口层的「墙重合度量」
+    (core/entrance.wall_overlap) 直接消费——那里正是把"墙"当几何用的地方。"""
     out = cls.copy()
     w5 = out == 5
     if not w5.any():

@@ -15,7 +15,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from core.vision import (FIXED_PANEL, FOG_BGR, MATCH_METRIC, classify_region,
+from core.vision import (FIXED_PANEL, FOG_BGR, classify_region,
                          consistent_cost, content_bbox, to_match3, walls_as_floors)
 
 
@@ -52,17 +52,17 @@ def _revealed_mask(region, cls_r):
     return (((cls_r == 1) | (cls_r == 2) | (cls_r == 3)) & (~fog)).astype(np.uint8)
 
 
-def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
-                    center=None, radius=0, ref_oh=None):
-    """单尺度掩膜匹配。
+def _match_at_scale(ref_oh, temp_cls, temp_mask, bw, bh, s, ref_shape,
+                    center=None, radius=0):
+    """单尺度掩膜匹配（错配率口径，唯一口径）。
 
     返回 (score, ml_x, ml_y, res, msum, (off_x, off_y)) 或 None(尺度越界/掩膜太小)。
-    score = min(代价图)/掩膜数，越小越匹配；ml_x/ml_y 为匹配左上角在 ref 内容里的
-    **全图**整数位置；res 为响应面（center 给定时是窗口局部坐标系，配 off 用）。
+    score = min(代价图)/掩膜数 = **不一致像素加权占比** ∈[0,1]，越小越匹配。
+    ml_x/ml_y 为匹配左上角在 ref 内容里的**全图**整数位置；res 为响应面
+    （center 给定时是窗口局部坐标系，配 off 用）。
+    ref_oh: 参考侧 3 通道 one-hot（to_match3；调用方须先经 walls_as_floors）。
     center: 图标锚定的模板左上角(ref坐标)——给定时平移只在该点 ±radius 邻域内搜
     （防自相似迷宫的幽灵相位，见 ANCHOR_RADIUS 注）。
-    ref_oh: 参考侧的 one-hot(3 通道)；非 None ⇒ 走「错配率」口径（core/vision.py 长注），
-    代价图 = 掩膜权重和 − 加权一致数，故 score = 不一致占比。为 None ⇒ 旧「类号平方差」。
     """
     tw, th = int(bw * s), int(bh * s)
     if tw < 10 or th < 10 or th > ref_shape[0] or tw > ref_shape[1]:
@@ -72,15 +72,11 @@ def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
     msum = float(tmk.sum())
     if msum < 50:
         return None
-    tmk_f = tmk.astype(np.float32)
-    if ref_oh is not None:
-        tpl = to_match3(tcl) * tmk_f[..., None]   # 掩膜折进模板（掩膜外填 0）
-    else:
-        tpl = tcl.astype(np.float32)
+    # 掩膜折进模板（掩膜外填 0）⇒ 一致计数可走不带 mask 的 CCORR（FFT 快路）。
+    tpl = to_match3(tcl) * tmk.astype(np.float32)[..., None]
     off_x = off_y = 0
     if center is None:
-        res = (consistent_cost(ref_oh, tpl, msum) if ref_oh is not None
-               else cv2.matchTemplate(ref_f, tpl, cv2.TM_SQDIFF, mask=tmk_f))
+        res = consistent_cost(ref_oh, tpl, msum)
     else:
         cx, cy = center
         x0 = max(0, int(cx - radius))
@@ -91,10 +87,8 @@ def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
             return None
         if radius == 0 and (x0 != int(cx) or y0 != int(cy)):
             return None   # 钉平移模式: 锚点出界该尺度直接跳过, 不许钳位漂移
-        src = (ref_oh if ref_oh is not None else ref_f)[y0:y1, x0:x1]
-        res = (consistent_cost(np.ascontiguousarray(src), tpl, msum)
-               if ref_oh is not None
-               else cv2.matchTemplate(src, tpl, cv2.TM_SQDIFF, mask=tmk_f))
+        src = np.ascontiguousarray(ref_oh[y0:y1, x0:x1])
+        res = consistent_cost(src, tpl, msum)
         off_x, off_y = x0, y0
     # ⚠️ OpenCV 返回顺序是 (minVal, maxVal, minLoc, maxLoc) —— minLoc 是**第 3 个**。
     # 2026-09-16 实机抓到的重大 bug：这里原写作 `mn, _, _, ml =`，于是 ml 拿到的是
@@ -133,8 +127,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
 
     用迷雾剔除后的探明模板，对参考图(内容裁剪)做掩膜匹配，取最佳
     (尺度,位置)构造相似变换。地图恒北朝上，故无旋转，仅缩放+平移。
-    返回 (M, score, overlap) 或 None(探明不足)。score 越小越重合，量纲随口径变：
-    consistency(=错配率, [0,1], 闸 ~0.25) / sqdiff(旧「类号平方差」, 闸 0.30)。
+    返回 (M, score, overlap) 或 None(探明不足)。score = **错配率** ∈[0,1]（不一致像素的
+    加权占比），越小越重合；显示闸见 config [match] align_score_max。
 
     region: 已裁好的面板 BGR(跟随循环只截面板区域时用)；None 则从 shot_bgr 按 panel 裁。
     hint_s: 上次对齐的尺度提示。给了就跳过 12 档粗搜，直接在 hint±0.06 细搜(省 ~0.4s)。
@@ -181,12 +175,10 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     ref_c = cv2.copyMakeBorder(ref_bgr[cy0:cy0 + ch, cx0:cx0 + cw],
                                PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=(0, 0, 0))
     ref_cls = walls_as_floors(classify_region(ref_c), ref_c)
-    ref_f = ref_cls.astype(np.float32)
     ref_shape = ref_cls.shape
-    # 口径（config [match] metric，见 core/vision.py 长注）：
-    #   consistency ⇒ 参考侧预生成 3 通道 one-hot，代价图 = 掩膜和 − 一致数 ⇒ score = 错配率；
-    #   sqdiff      ⇒ None，走旧「类号平方差」。
-    ref_oh = to_match3(ref_cls) if MATCH_METRIC == "consistency" else None
+    # 参考侧预生成 3 通道 one-hot：代价图 = 掩膜和 − 加权一致数 ⇒ score = 错配率
+    # （core/vision.py 长注）。这是**唯一**口径，旧的「类号平方差」已删。
+    ref_oh = to_match3(ref_cls)
 
     def _anchored_center(s):
         """该尺度下图标锚定的模板左上角(ref 补边坐标系)。ref 补边坐标 = 原图-(cx0-PAD)，
@@ -202,8 +194,7 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
         for s in scale_list:
             kw = ({"center": _anchored_center(float(s)), "radius": ANCHOR_RADIUS}
                   if hint_icon is not None else {})
-            r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
-                                ref_oh=ref_oh, **kw)
+            r = _match_at_scale(ref_oh, temp_cls, temp_mask, bw, bh, s, ref_shape, **kw)
             if r is None:
                 continue
             if best is None or r[0] < best[0]:
@@ -218,8 +209,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
             return None
         kw = ({"center": _anchored_center(float(hint_s)), "radius": ANCHOR_RADIUS}
               if hint_icon is not None else {})
-        r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape,
-                            ref_oh=ref_oh, **kw)
+        r = _match_at_scale(ref_oh, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape,
+                            **kw)
         if r is None:
             return None
         sc, s, ml_x, ml_y, res, _msum, _off = r[0], float(hint_s), r[1], r[2], r[3], r[4], r[5]

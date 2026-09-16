@@ -22,7 +22,7 @@ import cv2  # noqa: E402
 
 from core.alignment import find_overlay_transform  # noqa: E402
 from core.entrance import (  # noqa: E402
-    _crop_around_icon, build_entrance_transform, build_sample_mask,
+    _crop_around_icon, build_entrance_transform, sample_structure,
     find_seed_by_entrance, load_index,
 )
 from core.map_library import MapLibrary  # noqa: E402
@@ -105,7 +105,7 @@ def evaluate_sample(shot, lib, entrance_type, gt_seed):
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
                     degenerate=False, rejected=False)
     # 快速失败闸镜像（app._entrance_pipeline_impl 同款先于匹配）：未探明样本 app 拒答。
-    cls, mask, _ = build_sample_mask(_crop_around_icon(shot, panel, ip, 0.18, icon_k=ik))
+    cls, mask = sample_structure(_crop_around_icon(shot, panel, ip, 0.18, icon_k=ik))
     if mask.mean() < SAMPLE_MASK_MIN:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
@@ -122,7 +122,7 @@ def evaluate_sample(shot, lib, entrance_type, gt_seed):
                 if res and not _degen(res):
                     break
                 crop = _crop_around_icon(shot, panel, ip, hf, icon_k=ik)
-                _c2, m2, _ = build_sample_mask(crop)
+                _c2, m2 = sample_structure(crop)
                 if m2.mean() < SAMPLE_MASK_MIN:
                     continue
                 r2, _ip2, _isc2, _ik2 = find_seed_by_entrance(
