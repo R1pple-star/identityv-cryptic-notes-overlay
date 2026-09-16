@@ -21,8 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.vision import (FIXED_PANEL, FOG_BGR, _find_icon, classify_region,
-                         load_bgr, walls_as_floors)
+from core.vision import (FIXED_PANEL, FOG_BGR, MATCH_METRIC, _find_icon, classify_region,
+                         load_bgr, to_simplex, walls_as_floors)
 
 ROOT = Path(__file__).resolve().parent.parent
 with open(ROOT / "config.toml", "rb") as _f:
@@ -58,6 +58,46 @@ _PASS_W = float(_CFG["match"].get("passage_weight", 0.5))
 # 墙色雾免疫(雾最亮~75 < 墙带下沿~95)，贴墙像素=最不易被雾环污染的可靠结构。
 _WALL_BOOST = float(_CFG["match"].get("wall_boost", 0.0))
 _WALL_BAND = 9
+# 图标锚定（2026-09-15 上线）：样本图标 ↔ 引索图标重合后**钉死平移只搜尺度**，尺度由
+# 「图标当尺子」定 s0 = r_fine/k（两侧对同一模板 assets/_icon_entrance.png 做 NCC；k 由
+# _find_icon 细网格量，r_fine 由引索侧细网格量、存 json 的 scale_fine）。±_ANCHOR_BAND
+# 细修兜 s0 的量化误差。依据 experiments/e5_anchor_ab.py 的 2×2 实测：引索窗口放大到 2×
+# 后**全搜会炸**（主集 top-1 3/3→2/3、控制组低分确信 1→5——搜索域变大=自相似错位有机
+# 可乘），锚定把它抹平回 3/3 与 1，且控制组真种子排名由 7~24 名提到 1~7 名。
+# 关掉（false）→ 回「全搜 + 原 SCALES_ENT」，零扰动回滚。
+_ANCHOR_PIN = bool(_CFG["match"].get("anchor_pin", False))
+# _ANCHOR_BAND/_ANCHOR_STEP/_ANCHOR_N（尺度窄带 s0±0.06）已废弃：s0=r_fine/k 的残差是 ~0.09
+# 量级，窄带兜不住（2026-09-16 实测把 17.11 真种子18 挤成种子15）。锚定现在只钉平移、
+# 尺度走全域 SCALES_ENT。config 的 [match].anchor_band 保留但不再被读。
+# 匹配口径（config [match] metric，见 core/vision.MATCH_METRIC）：
+#   "consistency" = 错配率（新）——5 类嵌 R^4 正单纯形，4 通道 SQDIFF /(2·权重和)；
+#   "sqdiff"      = 旧「类号平方差」，逐位回滚用。原理与实测见 core/vision.py 长注。
+_METRIC = MATCH_METRIC
+
+
+def _crop_box(panel, icon_pos, half_frac=0.18, icon_k=None):
+    """算「以图标为中心」的方形裁样框，返回 (x0, y0, side)（panel 局部坐标）。
+
+    单独抽出来是为了给图标锚定算**样本图标在裁样内的偏移**（= icon_pos 的 panel 局部
+    坐标 - (x0,y0)）——`_crop_around_icon` 只回 ndarray，锚定取分需要原点。语义与
+    `_crop_around_icon` 完全同源，改动见其文档串。
+    """
+    px, py, pw, ph = panel
+    cx, cy = icon_pos
+    cxp, cyp = cx - px, cy - py
+    kf = max(1.0, (icon_k / ICON_K_REF)) if icon_k else 1.0
+    # 上限 316=228/0.36/2：放大档(k≈1.0→真s≈0.36-0.40)下侧长 632×0.36=228 恰可搜，
+    # 再大会把真尺度挤出可行域（710px 裁样实测全'-'）。同时保护梯子：0.25/0.32 档
+    # 在默认缩放下不至于全顶到同一个帽（284 帽实测压扁梯子 → 144715 丢失梯子救援）。
+    half_cap = 316
+    half = min(int(min(pw, ph) * half_frac * kf), half_cap)
+    edge = min(int(min(pw, ph) * 0.25 * kf), half_cap)
+    if cxp < edge or cxp > pw - edge or cyp < edge or cyp > ph - edge:
+        half = edge  # 贴边 → 增大样本（17.13 中央不触发，基线不变）
+    side = 2 * half
+    x0 = min(max(cxp - half, 0), max(0, pw - side))
+    y0 = min(max(cyp - half, 0), max(0, ph - side))
+    return x0, y0, side
 
 
 def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18, icon_k=None):
@@ -74,24 +114,9 @@ def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18, icon_k=None):
     icon 贴面板边缘时自动增大到 0.25 档（同乘 k 放大）。方框 clamp 入面板不截断。
     icon_k=None（手框样本等无图标尺度的场景）→ 保持旧行为不缩放。"""
     px, py, pw, ph = panel
-    cx, cy = icon_pos
-    cxp, cyp = cx - px, cy - py
-    kf = max(1.0, (icon_k / ICON_K_REF)) if icon_k else 1.0
-    # 上限 316=228/0.36/2：放大档(k≈1.0→真s≈0.36-0.40)下侧长 632×0.36=228 恰可搜，
-    # 再大会把真尺度挤出可行域（710px 裁样实测全'-'）。同时保护梯子：0.25/0.32 档
-    # 在默认缩放下不至于全顶到同一个帽（284 帽实测压扁梯子 → 144715 丢失梯子救援）。
-    half_cap = 316
-    half = min(int(min(pw, ph) * half_frac * kf), half_cap)
-    edge = min(int(min(pw, ph) * 0.25 * kf), half_cap)
-    if cxp < edge or cxp > pw - edge or cyp < edge or cyp > ph - edge:
-        half = edge  # 贴边 → 增大样本（17.13 中央不触发，基线不变）
+    x0, y0, side = _crop_box(panel, icon_pos, half_frac, icon_k)
     region = shot[py:py + ph, px:px + pw]
-    side = 2 * half
-    x0 = min(max(cxp - half, 0), max(0, pw - side))
-    x1 = x0 + side
-    y0 = min(max(cyp - half, 0), max(0, ph - side))
-    y1 = y0 + side
-    return region[y0:y1, x0:x1].copy()
+    return region[y0:y0 + side, x0:x0 + side].copy()
 
 
 def build_sample_mask(crop):
@@ -120,6 +145,54 @@ def build_sample_mask(crop):
     return cls, mask, w
 
 
+def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
+    """在某种子的引索裁图上扫 `scales`，返回 (最优分, 获胜尺度, mloc)。分越小越匹配。
+
+    anchor=(rx, ry, s0) 非 None → **图标锚定档**：引索图标在裁图内偏移 (rx,ry) 与样本图标
+    在裁样内偏移 icon_off 重合，模板落点唯一确定 ⇒ 只读分图上那一个位置 res[ay,ax]，
+    **不平移搜索**（治自相似错位＝幽灵相位）。锚点出界 → 该尺度跳过，不许钳位漂移
+    （同 core/alignment.py ANCHOR_RADIUS=0 的做法）。anchor=None → 全搜 minMaxLoc。
+    两种取法读的是**同一张 matchTemplate 分图**，归一分母同为 wsum，故公式逐位可比。
+    """
+    best = (1e9, None, None)
+    in_h, in_wd = in_cls.shape[:2]
+    # 新口径：引索侧单纯形嵌入（每种子一次，尺度循环内复用）。
+    idx_simp = to_simplex(idx_cls) if _METRIC == "consistency" else None
+    for s in scales:
+        tw, th = int(in_wd * s), int(in_h * s)
+        if tw < 10 or th < 10 or th > idx_cls.shape[0] or tw > idx_cls.shape[1]:
+            continue
+        if min(tw, th) < MIN_TEMPLATE_PX:  # 防小模板假获胜（见常量注释）
+            continue
+        tcl = cv2.resize(in_cls, (tw, th), interpolation=cv2.INTER_NEAREST)
+        tmk = cv2.resize(in_w, (tw, th), interpolation=cv2.INTER_NEAREST)
+        wsum = float(tmk.sum())
+        if wsum < 50:
+            continue
+        if _METRIC == "consistency":
+            # 4 通道单纯形：响应 = 2×(加权不一致像素数) ⇒ /(2·wsum) = 错配率
+            res = cv2.matchTemplate(idx_simp, to_simplex(tcl), cv2.TM_SQDIFF,
+                                    mask=tmk.astype(np.float32))
+            div = 2.0 * wsum
+        else:
+            res = cv2.matchTemplate(idx_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
+                                    mask=tmk.astype(np.float32))
+            div = wsum
+        if anchor is not None:
+            rx, ry, _s0 = anchor
+            ax = int(round(rx - icon_off[0] * (tw / in_wd)))
+            ay = int(round(ry - icon_off[1] * (th / in_h)))
+            if not (0 <= ax < res.shape[1] and 0 <= ay < res.shape[0]):
+                continue   # 锚点出界：该尺度跳过，不许钳位漂移（与对齐层 ANCHOR_RADIUS=0 同规）
+            sc, ml = float(res[ay, ax]) / div, (ax, ay)
+        else:
+            mn, _, _, ml = cv2.minMaxLoc(res)   # §3.1：取 argmin 位置，旧版只读 res.min()
+            sc, ml = float(mn) / div, (int(ml[0]), int(ml[1]))
+        if sc < best[0]:
+            best = (sc, s, ml)
+    return best
+
+
 def find_seed_by_entrance(shot, lib, entrance_type: str,
                           index_dir=ENTRANCE_INDEX_DIR, panel=FIXED_PANEL,
                           top_n=6, sample_crop=None):
@@ -142,6 +215,12 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         return [], icon_pos, icon_score, icon_k
 
     fl = ENTRANCE_FLOOR[entrance_type]
+    # 样本图标在裁样内的偏移（屏幕px）——锚定档的平移基准。手框路径(sample_crop)无图标→None。
+    icon_off = None
+    if sample_crop is None and icon_pos is not None:
+        bx0, by0, _side = _crop_box(panel, icon_pos, 0.18, icon_k=icon_k)
+        icon_off = ((icon_pos[0] - panel[0]) - bx0, (icon_pos[1] - panel[1]) - by0)
+
     results = []
     for seed in lib.seeds():
         idx_path = index_dir / f"{seed}_{entrance_type}.png"
@@ -150,23 +229,34 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         idx_bgr = load_bgr(str(idx_path))
         idx_cls = walls_as_floors(classify_region(idx_bgr), idx_bgr)
         idx_f = idx_cls.astype(np.float32)
-        best_sc, best_s, best_mloc = 1e9, None, None
-        for s in SCALES_ENT:
-            tw, th = int(in_cls.shape[1] * s), int(in_cls.shape[0] * s)
-            if tw < 10 or th < 10 or th > idx_cls.shape[0] or tw > idx_cls.shape[1]:
-                continue
-            if min(tw, th) < MIN_TEMPLATE_PX:  # 防小模板假获胜（见常量注释）
-                continue
-            tcl = cv2.resize(in_cls, (tw, th), interpolation=cv2.INTER_NEAREST)
-            tmk = cv2.resize(in_w, (tw, th), interpolation=cv2.INTER_NEAREST)
-            if tmk.sum() < 50:
-                continue
-            res = cv2.matchTemplate(idx_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
-                                   mask=tmk.astype(np.float32))
-            mn, _, _, ml = cv2.minMaxLoc(res)   # §3.1：取 argmin 位置，旧版只读 res.min()
-            sc = float(mn) / float(tmk.sum())  # = float(res.min())/sum，与旧版同值→基线不变
-            if sc < best_sc:
-                best_sc, best_s, best_mloc = sc, s, (int(ml[0]), int(ml[1]))
+
+        # 锚定档参数：引索图标在裁图内偏移(rx,ry) + 图标当尺子定尺度 s0 = r_fine/k。
+        anchor = None
+        if _ANCHOR_PIN and icon_off is not None and icon_k:
+            js = load_index(seed, index_dir)
+            ent = js.get(entrance_type) if js else None
+            if ent and "box" in ent:
+                r_fine = float(ent.get("scale_fine", ent["scale"]))
+                anchor = (ent["cx"] - ent["box"][0], ent["cy"] - ent["box"][1],
+                          r_fine / icon_k)
+
+        if anchor is not None:
+            # 锚定档：钉死平移（治自相似幽灵相位），尺度仍走全域 SCALES_ENT —— 与
+            # core/alignment.py 的 hint_icon 同哲学（那里注释：锚住平移后尺度交给全档扫描）。
+            # 尺度窄带（s0±_ANCHOR_BAND）已废弃：s0=r_fine/k 的残差是 ~0.09 量级，窄带兜不住，
+            # 2026-09-16 实测它把 17.11 的真种子18 挤成种子15。
+            #
+            # **锚点出界 = 该种子弃权，不回退全搜**（2026-09-16 修）：先前写法是"本种子锚定
+            # 一档都没落下 → 偷偷换成全搜"，而全搜取的是每个尺度的全局最小、恒 ≤ 锚点那一点的
+            # 值 —— 于是"锚点用不了的种子"自动获得更宽的自由度，靠不公平的优势压过真种子
+            # （17.11：种子15 锚点 0/13 档可用 → 回退全搜得 0.109，以 0.005 之差赢了种子18 的
+            # 锚定值 0.114）。这与 CLAUDE.md 对齐层记的"锚定取分单调只升不降"是同一个病。
+            # 公平做法：同一统计量才可比 —— 锚点不可用就不参与排名。
+            best_sc, best_s, best_mloc = _scan_seed(in_cls, in_w, idx_cls, idx_f,
+                                                    SCALES_ENT, anchor, icon_off)
+        else:
+            best_sc, best_s, best_mloc = _scan_seed(in_cls, in_w, idx_cls, idx_f,
+                                                    SCALES_ENT, None, None)
         info = lib.get(seed, "一楼")
         if best_s is None:
             # 无任何尺度放得下（样本大于该种子引索裁图，如手框过大）：不计入。

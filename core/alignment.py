@@ -15,8 +15,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from core.vision import (FIXED_PANEL, FOG_BGR, classify_region, content_bbox,
-                         walls_as_floors)
+from core.vision import (FIXED_PANEL, FOG_BGR, MATCH_METRIC, classify_region, content_bbox,
+                         to_simplex, walls_as_floors)
 
 
 # 尺度搜索：游戏内地图缩放随玩家平移/缩放而变，真实尺度常落在 0.7~0.85(面板适配)。
@@ -53,14 +53,17 @@ def _revealed_mask(region, cls_r):
 
 
 def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
-                    center=None, radius=0):
+                    center=None, radius=0, ref_simp=None):
     """单尺度掩膜 SQDIFF 匹配。
 
     返回 (score, ml_x, ml_y, res, msum, (off_x, off_y)) 或 None(尺度越界/掩膜太小)。
     score = min(SQDIFF)/掩膜数，越小越匹配；ml_x/ml_y 为匹配左上角在 ref 内容里的
     **全图**整数位置；res 为响应面（center 给定时是窗口局部坐标系，配 off 用）。
     center: 图标锚定的模板左上角(ref坐标)——给定时平移只在该点 ±radius 邻域内搜
-    （防自相似迷宫的幽灵相位，见 ANCHOR_RADIUS 注）。"""
+    （防自相似迷宫的幽灵相位，见 ANCHOR_RADIUS 注）。
+    ref_simp: 参考侧的单纯形嵌入(4 通道)；非 None ⇒ 走「错配率」口径（core/vision.py 长注），
+    响应 = 2×(不一致像素数)，故除以 2·mask_sum。为 None ⇒ 旧「类号平方差」口径。
+    """
     tw, th = int(bw * s), int(bh * s)
     if tw < 10 or th < 10 or th > ref_shape[0] or tw > ref_shape[1]:
         return None
@@ -69,10 +72,15 @@ def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
     msum = float(tmk.sum())
     if msum < 50:
         return None
+    tmk_f = tmk.astype(np.float32)
+    if ref_simp is not None:
+        tpl, div = to_simplex(tcl), 2.0 * msum
+    else:
+        tpl, div = tcl.astype(np.float32), msum
     off_x = off_y = 0
     if center is None:
-        res = cv2.matchTemplate(ref_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
-                               mask=tmk.astype(np.float32))
+        res = cv2.matchTemplate(ref_simp if ref_simp is not None else ref_f, tpl,
+                               cv2.TM_SQDIFF, mask=tmk_f)
     else:
         cx, cy = center
         x0 = max(0, int(cx - radius))
@@ -83,11 +91,11 @@ def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
             return None
         if radius == 0 and (x0 != int(cx) or y0 != int(cy)):
             return None   # 钉平移模式: 锚点出界该尺度直接跳过, 不许钳位漂移
-        res = cv2.matchTemplate(ref_f[y0:y1, x0:x1], tcl.astype(np.float32),
-                                cv2.TM_SQDIFF, mask=tmk.astype(np.float32))
+        src = (ref_simp if ref_simp is not None else ref_f)[y0:y1, x0:x1]
+        res = cv2.matchTemplate(src, tpl, cv2.TM_SQDIFF, mask=tmk_f)
         off_x, off_y = x0, y0
     mn, _, _, ml = cv2.minMaxLoc(res)
-    return mn / msum, ml[0] + off_x, ml[1] + off_y, res, msum, (off_x, off_y)
+    return mn / div, ml[0] + off_x, ml[1] + off_y, res, msum, (off_x, off_y)
 
 
 def _subpixel_min(res, mx, my):
@@ -117,7 +125,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
 
     用迷雾剔除后的探明模板，对参考图(内容裁剪)做掩膜匹配，取最佳
     (尺度,位置)构造相似变换。地图恒北朝上，故无旋转，仅缩放+平移。
-    返回 (M, score, overlap) 或 None(探明不足)。score 越小越重合(<0.10 较可信)。
+    返回 (M, score, overlap) 或 None(探明不足)。score 越小越重合，量纲随口径变：
+    consistency(=错配率, [0,1], 闸 ~0.25) / sqdiff(旧「类号平方差」, 闸 0.30)。
 
     region: 已裁好的面板 BGR(跟随循环只截面板区域时用)；None 则从 shot_bgr 按 panel 裁。
     hint_s: 上次对齐的尺度提示。给了就跳过 12 档粗搜，直接在 hint±0.06 细搜(省 ~0.4s)。
@@ -166,6 +175,10 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     ref_cls = walls_as_floors(classify_region(ref_c), ref_c)
     ref_f = ref_cls.astype(np.float32)
     ref_shape = ref_cls.shape
+    # 口径（config [match] metric，见 core/vision.py 长注）：
+    #   consistency ⇒ 参考侧预生成 4 通道单纯形嵌入，响应 = 2×不一致像素数 ⇒ score = 错配率；
+    #   sqdiff      ⇒ None，走旧「类号平方差」。
+    ref_simp = to_simplex(ref_cls) if MATCH_METRIC == "consistency" else None
 
     def _anchored_center(s):
         """该尺度下图标锚定的模板左上角(ref 补边坐标系)。ref 补边坐标 = 原图-(cx0-PAD)，
@@ -181,7 +194,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
         for s in scale_list:
             kw = ({"center": _anchored_center(float(s)), "radius": ANCHOR_RADIUS}
                   if hint_icon is not None else {})
-            r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape, **kw)
+            r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
+                                ref_simp=ref_simp, **kw)
             if r is None:
                 continue
             if best is None or r[0] < best[0]:
@@ -196,7 +210,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
             return None
         kw = ({"center": _anchored_center(float(hint_s)), "radius": ANCHOR_RADIUS}
               if hint_icon is not None else {})
-        r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape, **kw)
+        r = _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape,
+                            ref_simp=ref_simp, **kw)
         if r is None:
             return None
         sc, s, ml_x, ml_y, res, _msum, _off = r[0], float(hint_s), r[1], r[2], r[3], r[4], r[5]

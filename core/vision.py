@@ -27,6 +27,7 @@ def _load_config():
     defaults = {
         "panel_rect": (668, 166, 1064, 569),
         "icon_template": "_icon_entrance.png",
+        "metric": "sqdiff",
     }
     try:
         with open(_CONFIG_PATH, "rb") as f:
@@ -36,6 +37,7 @@ def _load_config():
         defaults["panel_rects"] = {k: tuple(v)
                                    for k, v in cfg["panel"].get("rects", {}).items()}
         defaults["icon_template"] = cfg["paths"]["icon_template"]
+        defaults["metric"] = cfg["match"].get("metric", "sqdiff")
     except Exception:
         pass
     return defaults
@@ -47,6 +49,9 @@ _CFG = _load_config()
 # 其它分辨率经 panel_for_screen 等比外推或查 config [panel.rects] 校准表。
 FIXED_PANEL = _CFG["panel_rect"]
 _PANEL_REF_RES = _CFG["panel_res"]
+# 匹配口径（config [match] metric）："consistency" = 错配率（新）/ "sqdiff" = 类号平方差（旧）。
+# 入口引索匹配与投影重合两侧共用此开关；原理、实测与代价见 simplex5 长注。
+MATCH_METRIC = str(_CFG.get("metric", "sqdiff"))
 
 
 def panel_for_screen(w: int, h: int):
@@ -127,6 +132,37 @@ def walls_as_floors(cls, region):
     out[w5 & (out == 5) & (gray >= 85)] = 1   # 墙交界带(亮中性)——旧分类落 cls1 的那 0.2%
     out[w5 & (out == 5)] = 4                   # 中性且暗——旧 fog 桶
     return out
+
+
+# ===== 匹配口径：一致性（新）vs 类号平方差（旧）=====
+# 旧口径把 5 个类别当成数字 0..5 做 TM_SQDIFF，惩罚 = (类号差)²，纯属编号巧合：
+#   路(cls3)↔黑(cls0) 罚 9、房(cls2)↔路(cls3) 罚 1 —— 但两者都是"错"，凭什么差 9 倍。
+# 实测（2026-09-16，真种子+真尺度+锚定，实机截图）后果：真对齐下类别一致率 87%~92%，
+# 可 4.4%~6.1% 的像素（全是 |差|=3 那类）贡献了 69%~95% 的总分 → 真对齐算成 0.473~2.560，
+# 永远过不了 0.30 的显示闸；而"缩到最小尺度让模板躲进均匀区"能把分离群像素挤出去 → 分更低
+# → 全搜恒钉尺度下界（把下界从 0.30 改 0.25，5/5 立刻跟着降到 0.250~0.258）。
+#
+# 新口径：把 5 类嵌成 R^4 里正单纯形的 5 个顶点 —— **任意两类之间平方距离全相等(=2)**。
+# 于是 4 通道 TM_SQDIFF 的响应 = 2×(不一致像素数)，除以 2·权重和 即「错配率」∈[0,1]：
+# 可读懂、与类号编排无关、且"缩模板"的收益从 9× 压到 1×。
+# 只用 4 通道 ⇒ matchTemplate 调用次数不变（默认上限就是 4 通道，故 6 类不能直接 one-hot）。
+# 实测同 M 下：旧口径 0.574 → 新口径 0.132（= 1-87%，与独立量出的一致率自洽）。
+_SIMPLEX5 = None
+
+
+def simplex5() -> np.ndarray:
+    """5 类 → R^4 正单纯形顶点，shape (5,4)，任意两类平方距离 = 2。"""
+    global _SIMPLEX5
+    if _SIMPLEX5 is None:
+        # 中心化 one-hot (I - J/5) 的右奇异向量前 4 行张成「正交于 (1,1,1,1,1) 的 4 维子空间」。
+        # 中心化保距 ⇒ 投影到该子空间后仍保距，即 5 个顶点的两两平方距离全 = 2（one-hot 时 = 2）。
+        _SIMPLEX5 = np.linalg.svd(np.eye(5) - 1.0 / 5)[2][:4].T.astype(np.float32)
+    return _SIMPLEX5
+
+
+def to_simplex(cls: np.ndarray) -> np.ndarray:
+    """(H,W) 类别图 → (H,W,4) float32 单纯形嵌入。调用方须先经 walls_as_floors 归并 cls5。"""
+    return simplex5()[np.clip(cls.astype(np.int32), 0, 4)]
 
 
 def content_bbox(bgr_img: np.ndarray, thresh: int = 60) -> tuple[int, int, int, int]:
