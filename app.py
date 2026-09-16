@@ -600,9 +600,10 @@ class MainWindow(QWidget):
         if panel is None:
             self._log_step("屏幕分辨率未适配（非16:9且未校准）", "ERROR"); return
         res, icon_pos, isc, _ik = find_seed_by_entrance(
-            self._shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample)
+            self._shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample,
+            sample_origin=(x0, y0))
         if not res:
-            self._log_step("手框样本仍无匹配 → 框小一点(入口局部结构,约300px内)或用3点标定", "WARN")
+            self._log_step("手框样本仍无匹配 → 换一处含墙角/房间边缘的区域再框，或用3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=True)
             return
         best = res[0]

@@ -96,7 +96,13 @@ def _match_at_scale(ref_f, temp_cls, temp_mask, bw, bh, s, ref_shape,
                if ref_oh is not None
                else cv2.matchTemplate(src, tpl, cv2.TM_SQDIFF, mask=tmk_f))
         off_x, off_y = x0, y0
-    mn, _, _, ml = cv2.minMaxLoc(res)
+    # ⚠️ OpenCV 返回顺序是 (minVal, maxVal, minLoc, maxLoc) —— minLoc 是**第 3 个**。
+    # 2026-09-16 实机抓到的重大 bug：这里原写作 `mn, _, _, ml =`，于是 ml 拿到的是
+    # **最大代价**的位置（= 全黑角落），而分数 mn 是最小代价的分数。同一张响应图上
+    # 取分和取点来自两个不同位置 ⇒ 分很漂亮、投影却落在十万八千里（重叠≈0）。
+    # 实机 5/6 张"匹配到了没重合"的直接原因。锚定档（窗搜 radius=0，res 是 1×1）不受
+    # 影响，故 17.13/17.11 这类有线锚定的回归用例一直"看着正常"。
+    mn, _, ml, _ = cv2.minMaxLoc(res)
     return mn / msum, ml[0] + off_x, ml[1] + off_y, res, msum, (off_x, off_y)
 
 

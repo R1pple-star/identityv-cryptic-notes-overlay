@@ -251,7 +251,9 @@ def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
                 continue   # 锚点出界：该尺度跳过，不许钳位漂移（与对齐层 ANCHOR_RADIUS=0 同规）
             sc, ml = float(res[ay, ax]) / div, (ax, ay)
         else:
-            mn, _, _, ml = cv2.minMaxLoc(res)   # §3.1：取 argmin 位置，旧版只读 res.min()
+            # ⚠️ 顺序是 (minVal, maxVal, minLoc, maxLoc)：minLoc 是第 3 个。原写作
+            # `mn, _, _, ml =` 取到的是 maxLoc（与 min 分数不配套），同 alignment 那处 bug。
+            mn, _, ml, _ = cv2.minMaxLoc(res)   # §3.1：取 argmin 位置
             sc, ml = float(mn) / div, (int(ml[0]), int(ml[1]))
         if sc < best[0]:
             best = (sc, s, ml)
@@ -260,7 +262,7 @@ def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
 
 def find_seed_by_entrance(shot, lib, entrance_type: str,
                           index_dir=ENTRANCE_INDEX_DIR, panel=FIXED_PANEL,
-                          top_n=6, sample_crop=None):
+                          top_n=6, sample_crop=None, sample_origin=None):
     """入口引索匹配。返回 ([(score, seed, 方向-门, 楼层, s, mloc), ...], icon_pos, icon_score, icon_k)。
 
     score 越小越匹配。entrance_type ∈ {正门, 侧门, 二楼}。
@@ -269,6 +271,10 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
     icon_k 为图标检测获胜尺度（「图标当尺子」，裁样按它缩放），缺时 None。
     sample_crop: 手动框选的入口样本(HxWx3 BGR)，阶段3 手框纠错用；给了则用它做
     in_cls/in_mask(跳过 _crop_around_icon)，None 则自动以图标为中心裁。默认 None=基线。
+    sample_origin: 手框样本左上角的**屏幕坐标**(x0,y0)。墙重合口径**必须**有它：
+    锚点=「样本图标 ↔ 引索图标」，而图标在样本内的偏移要靠样本原点算得。
+    2026-09-16 实机前该参数不存在 ⇒ 手框路径 icon_off 恒 None ⇒ 墙口径下每个种子都
+    弃权 ⇒ 手框**恒返回空**（日志里 9/9 次「手框样本仍无匹配」即此因，与框大小无关）。
     """
     icon_pos, icon_score, icon_k = _find_icon(shot, *panel)
     if icon_pos is None and sample_crop is None:
@@ -282,11 +288,17 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
     game_wall = (classify_region(in_crop) == 5) if _ENTRANCE_METRIC == "wall" else None
 
     fl = ENTRANCE_FLOOR[entrance_type]
-    # 样本图标在裁样内的偏移（屏幕px）——锚定档的平移基准。手框路径(sample_crop)无图标→None。
+    # 样本图标在样本内的偏移（屏幕px）——锚定档的平移基准。手框路径同样要算（见下面注释）。
     icon_off = None
-    if sample_crop is None and icon_pos is not None:
-        bx0, by0, _side = _crop_box(panel, icon_pos, 0.18, icon_k=icon_k)
-        icon_off = ((icon_pos[0] - panel[0]) - bx0, (icon_pos[1] - panel[1]) - by0)
+    if icon_pos is not None:
+        if sample_crop is None:
+            bx0, by0, _side = _crop_box(panel, icon_pos, 0.18, icon_k=icon_k)
+            icon_off = ((icon_pos[0] - panel[0]) - bx0, (icon_pos[1] - panel[1]) - by0)
+        elif sample_origin is not None:
+            # 手框：框原点即样本左上角 ⇒ 图标在样本内偏移 = 图标屏幕坐标 − 框原点。
+            # 与自动路径同一个量纲（样本内像素），故锚定公式一字不改。缺 sample_origin
+            # （老调用方）仍是 None ⇒ 墙口径下全体弃权，不静默退化成别的东西。
+            icon_off = (icon_pos[0] - sample_origin[0], icon_pos[1] - sample_origin[1])
 
     results = []
     for seed in lib.seeds():
