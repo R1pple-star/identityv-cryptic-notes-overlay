@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from core.vision import (FIXED_PANEL, FOG_BGR, MATCH_METRIC, _find_icon, classify_region,
-                         load_bgr, to_simplex, walls_as_floors)
+                         consistent_cost, load_bgr, to_match3, walls_as_floors)
 
 ROOT = Path(__file__).resolve().parent.parent
 with open(ROOT / "config.toml", "rb") as _f:
@@ -156,8 +156,8 @@ def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
     """
     best = (1e9, None, None)
     in_h, in_wd = in_cls.shape[:2]
-    # 新口径：引索侧单纯形嵌入（每种子一次，尺度循环内复用）。
-    idx_simp = to_simplex(idx_cls) if _METRIC == "consistency" else None
+    # 新口径：引索侧 one-hot（每种子一次，尺度循环内复用）。
+    idx_oh = to_match3(idx_cls) if _METRIC == "consistency" else None
     for s in scales:
         tw, th = int(in_wd * s), int(in_h * s)
         if tw < 10 or th < 10 or th > idx_cls.shape[0] or tw > idx_cls.shape[1]:
@@ -169,15 +169,15 @@ def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
         wsum = float(tmk.sum())
         if wsum < 50:
             continue
+        tmk_f = tmk.astype(np.float32)
         if _METRIC == "consistency":
-            # 4 通道单纯形：响应 = 2×(加权不一致像素数) ⇒ /(2·wsum) = 错配率
-            res = cv2.matchTemplate(idx_simp, to_simplex(tcl), cv2.TM_SQDIFF,
-                                    mask=tmk.astype(np.float32))
-            div = 2.0 * wsum
+            # 数"一致"（见 vision.to_match3 长注）：CCORR 无 mask ⇒ FFT 快路；掩膜折进模板
+            # （掩膜外填 0）。相减后仍是"越小越匹配"的代价图，故下游取 min 的逻辑不变。
+            res = consistent_cost(idx_oh, to_match3(tcl) * tmk_f[..., None], wsum)
         else:
             res = cv2.matchTemplate(idx_f, tcl.astype(np.float32), cv2.TM_SQDIFF,
-                                    mask=tmk.astype(np.float32))
-            div = wsum
+                                    mask=tmk_f)
+        div = wsum
         if anchor is not None:
             rx, ry, _s0 = anchor
             ax = int(round(rx - icon_off[0] * (tw / in_wd)))

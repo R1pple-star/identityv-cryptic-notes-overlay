@@ -139,30 +139,49 @@ def walls_as_floors(cls, region):
 #   路(cls3)↔黑(cls0) 罚 9、房(cls2)↔路(cls3) 罚 1 —— 但两者都是"错"，凭什么差 9 倍。
 # 实测（2026-09-16，真种子+真尺度+锚定，实机截图）后果：真对齐下类别一致率 87%~92%，
 # 可 4.4%~6.1% 的像素（全是 |差|=3 那类）贡献了 69%~95% 的总分 → 真对齐算成 0.473~2.560，
-# 永远过不了 0.30 的显示闸；而"缩到最小尺度让模板躲进均匀区"能把分离群像素挤出去 → 分更低
+# 永远过不了显示闸；而"缩到最小尺度让模板躲进均匀区"能把离群像素挤出去 → 分更低
 # → 全搜恒钉尺度下界（把下界从 0.30 改 0.25，5/5 立刻跟着降到 0.250~0.258）。
 #
-# 新口径：把 5 类嵌成 R^4 里正单纯形的 5 个顶点 —— **任意两类之间平方距离全相等(=2)**。
-# 于是 4 通道 TM_SQDIFF 的响应 = 2×(不一致像素数)，除以 2·权重和 即「错配率」∈[0,1]：
-# 可读懂、与类号编排无关、且"缩模板"的收益从 9× 压到 1×。
-# 只用 4 通道 ⇒ matchTemplate 调用次数不变（默认上限就是 4 通道，故 6 类不能直接 one-hot）。
-# 实测同 M 下：旧口径 0.574 → 新口径 0.132（= 1-87%，与独立量出的一致率自洽）。
-_SIMPLEX5 = None
+# 新口径 = **错配率**（不一致像素占比 ∈[0,1]）：与类号编排无关、可直接读懂、且"缩模板"
+# 的收益从 9× 压到 1×。实测同 M 下 0.574 → 0.132（= 1-87%，与独立量出的一致率自洽）。
+#
+# 实现（2026-09-16 第二版，为速度）：**数"一致"而不是数"不一致"**。
+#   一致数 = Σ_{掩膜内 p} [t_p == r_p] = Σ_{c} ⟨掩膜内one-hot_c , 参考one-hot_c⟩，是一组
+#   **互相关**。互相关用 `TM_CCORR` 且**不带 mask** —— 不带 mask 时 OpenCV 走 FFT 快路，
+#   带 mask 则退化成逐点直算（最慢路径，且通道数再乘一遍）。掩膜可以**折进模板**：
+#   CCORR 是乘积，模板在掩膜外填 0 就等于掩膜。于是
+#       响应 = msum - 一致数   （msum = 掩膜权重和）
+#   仍是"越小越匹配"的代价图，下游 minMaxLoc / 亚像素抛物线**一字不改**。
+#   实测（引索 456×379 / 模板 200×200，单次 matchTemplate）：
+#       带mask SQDIFF 1通道(旧) 5.48ms | 带mask SQDIFF 4通道(第一版) 21.85ms
+#       无mask CCORR 4通道 9.25ms | **无mask CCORR 3通道(本版) ≈7ms**
+#
+# 为什么 3 通道够（不必 4/5）：
+#   掩膜内**模板**类只可能是 1/2/3（cls0 黑 / cls4 雾 / cls5 墙 都在掩膜外 —— mask 定义即
+#   (cls∈{1,2,3}) & ~fog），所以模板不需要 cls0/cls4 的通道；参考侧落在那两类的像素
+#   三通道全 0，与模板任何通道都不相乘 ⇒ 自动计为"不一致"。逐位无损。
+#   反之若数"不一致"（SQDIFF）就必须给 cls0/雾 留通道，5 类需 4 维单纯形 —— 又慢又笨。
+def to_match3(cls: np.ndarray) -> np.ndarray:
+    """(H,W) 类别图 → (H,W,3) float32 one-hot：通道 0/1/2 = [cls==1]/[cls==2]/[cls==3]。
+
+    仅供「一致计数」用（见本段长注）。调用方须先经 walls_as_floors 归并 cls5。
+    """
+    idx = cls.astype(np.uint8)
+    out = np.zeros(cls.shape + (3,), np.float32)
+    out[..., 0] = idx == 1
+    out[..., 1] = idx == 2
+    out[..., 2] = idx == 3
+    return out
 
 
-def simplex5() -> np.ndarray:
-    """5 类 → R^4 正单纯形顶点，shape (5,4)，任意两类平方距离 = 2。"""
-    global _SIMPLEX5
-    if _SIMPLEX5 is None:
-        # 中心化 one-hot (I - J/5) 的右奇异向量前 4 行张成「正交于 (1,1,1,1,1) 的 4 维子空间」。
-        # 中心化保距 ⇒ 投影到该子空间后仍保距，即 5 个顶点的两两平方距离全 = 2（one-hot 时 = 2）。
-        _SIMPLEX5 = np.linalg.svd(np.eye(5) - 1.0 / 5)[2][:4].T.astype(np.float32)
-    return _SIMPLEX5
+def consistent_cost(ref_oh: np.ndarray, tpl_oh: np.ndarray, wsum: float) -> np.ndarray:
+    """一致计数的代价图：`wsum - 加权一致像素数`（越小越匹配，= 不一致加权数）。
 
-
-def to_simplex(cls: np.ndarray) -> np.ndarray:
-    """(H,W) 类别图 → (H,W,4) float32 单纯形嵌入。调用方须先经 walls_as_floors 归并 cls5。"""
-    return simplex5()[np.clip(cls.astype(np.int32), 0, 4)]
+    ref_oh / tpl_oh 均为 to_match3 输出；tpl_oh 须已乘掩膜权重（掩膜外为 0）。
+    **不带 mask**，故走 FFT 快路。返回 float32 响应面，正值 = 不一致数；FFT 舍入可能
+    产生 ~1e-2 级负值（完美匹配附近），下游按"越小越好"处理即可，不必钳。
+    """
+    return (wsum - cv2.matchTemplate(ref_oh, tpl_oh, cv2.TM_CCORR)).astype(np.float32)
 
 
 def content_bbox(bgr_img: np.ndarray, thresh: int = 60) -> tuple[int, int, int, int]:
