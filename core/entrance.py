@@ -73,6 +73,11 @@ _ANCHOR_PIN = bool(_CFG["match"].get("anchor_pin", False))
 #   "consistency" = 错配率（新）——5 类嵌 R^4 正单纯形，4 通道 SQDIFF /(2·权重和)；
 #   "sqdiff"      = 旧「类号平方差」，逐位回滚用。原理与实测见 core/vision.py 长注。
 _METRIC = MATCH_METRIC
+# 入口层用哪个分排序（config [match] entrance_metric）：
+#   "wall"（新，推荐）= 墙双向覆盖率取负（见下方"墙重合度量"长注），需锚点，无锚点即弃权；
+#   "class"          = 5 类错配率（现状）。两者都归一到"越小越好"，故排序/闸门语义不变；
+# 但**量纲不同**：换它必须同改 [match] score_confident（class 0.22 ↔ wall 0.45，见 config 注释）。
+_ENTRANCE_METRIC = str(_CFG["match"].get("entrance_metric", "class"))
 
 
 def _crop_box(panel, icon_pos, half_frac=0.18, icon_k=None):
@@ -145,6 +150,66 @@ def build_sample_mask(crop):
     return cls, mask, w
 
 
+# ===== 墙重合度量（2026-09-16 用户提议，`[match] entrance_metric = "wall"`）=====
+# 动机：5 类标签的"错配率"在大片均匀区（长走廊/大房间）没有判别力 —— 那里挪 40px 还是
+# "全一致"，正是入口样本最常见的形态；而"墙"是 1-9px 的细线，一挪就错开。
+# 做法（只比几何，不比色块）：
+#   ① 两侧各取墙掩膜 `classify_region(...)==5`（墙色已标定、**雾免疫**：雾最亮~75 < 墙带下沿~95）
+#   ② 样本墙按入口尺度 s 缩放，锚定落点对齐（样本图标 ↔ 引索图标）
+#   ③ 双向覆盖率：自己有多少比例的墙落在「对方墙膨胀 r 像素」带上，两个方向取平均
+#   ④ 容差 r 吸收厚度差（游戏内墙 5-9px vs 参考墙 1-3px），故不要求逐像素相等
+#   ⑤ 分 = 1 - 双向覆盖率（沿用"越小越匹配"，下游排序/闸门语义不变）
+# 实测（2026-09-16，6 张有真值的样本）：真种子**5/5 排第一**，领先次名 17%~58%；
+# 位置敏感对照：引索墙平移 40px 后覆盖率 0.83→0.30 / 0.78→0.36 / 0.56→0.18。
+# 天然拒答：样本几乎没墙（未探明）时全部尺度跳过 ⇒ 该种子弃权 ⇒ 全体弃权则无结果，
+# 正好落在"刚进门信息缺失应拒答"上。
+_WALL_RADII = (2, 3, 4, 6)   # 膨胀容差(引索像素)
+_MIN_WALL_PX = 30            # 单侧墙像素下限：低于此值覆盖率没统计意义，该尺度弃用
+
+
+def _cover(a, b, r):
+    """a 中有多少比例落在 dilate(b, r) 上。"""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2)
+    return float((cv2.dilate(b.astype(np.uint8), k) > 0)[a].mean()) if a.any() else 0.0
+
+
+def wall_overlap(g, r_wall):
+    """双向墙覆盖率均值 ∈[0,1]，越大越像。任一侧墙太少 → None（不可判）。"""
+    if g.sum() < _MIN_WALL_PX or r_wall.sum() < _MIN_WALL_PX:
+        return None
+    return float(np.mean([np.mean([_cover(g, r_wall, r), _cover(r_wall, g, r)])
+                          for r in _WALL_RADII]))
+
+
+def _scan_seed_wall(game_wall, ref_wall, scales, anchor, icon_off):
+    """墙重合档：扫 `scales`，返回 (1-双向墙覆盖率, 获胜尺度, 落点)（越小越好）。
+
+    只在锚定落点处评一次（不做平移搜索）—— 墙是尖的，但迷宫走廊网格自相似，全搜仍可能
+    锁进幽灵相位，锚点仍是唯一无歧义约束。锚点缺失时调用方应弃权（不许回退全搜：统计量
+    不同就不可比，见 find_seed_by_entrance 注释）。
+    """
+    best = (1e9, None, None)
+    gh, gw = game_wall.shape[:2]
+    for s in scales:
+        tw, th = int(gw * s), int(gh * s)
+        if tw < 10 or th < 10 or th > ref_wall.shape[0] or tw > ref_wall.shape[1]:
+            continue
+        if min(tw, th) < MIN_TEMPLATE_PX:
+            continue
+        g = cv2.resize(game_wall.astype(np.uint8), (tw, th),
+                       interpolation=cv2.INTER_NEAREST) > 0
+        if g.sum() < _MIN_WALL_PX:
+            continue
+        ax = int(round(anchor[0] - icon_off[0] * (tw / gw)))
+        ay = int(round(anchor[1] - icon_off[1] * (th / gh)))
+        if not (0 <= ax <= ref_wall.shape[1] - tw and 0 <= ay <= ref_wall.shape[0] - th):
+            continue
+        ov = wall_overlap(g, ref_wall[ay:ay + th, ax:ax + tw])
+        if ov is not None and 1.0 - ov < best[0]:
+            best = (1.0 - ov, s, (ax, ay))
+    return best
+
+
 def _scan_seed(in_cls, in_w, idx_cls, idx_f, scales, anchor, icon_off):
     """在某种子的引索裁图上扫 `scales`，返回 (最优分, 获胜尺度, mloc)。分越小越匹配。
 
@@ -213,6 +278,8 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
     in_cls, in_mask, in_w = build_sample_mask(in_crop)
     if in_mask.sum() < 100:
         return [], icon_pos, icon_score, icon_k
+    # 墙重合档：样本侧墙掩膜（各自 classify 一次；build_sample_mask 只回 cls/权重，不含墙）
+    game_wall = (classify_region(in_crop) == 5) if _ENTRANCE_METRIC == "wall" else None
 
     fl = ENTRANCE_FLOOR[entrance_type]
     # 样本图标在裁样内的偏移（屏幕px）——锚定档的平移基准。手框路径(sample_crop)无图标→None。
@@ -227,8 +294,10 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         if not idx_path.exists():
             continue
         idx_bgr = load_bgr(str(idx_path))
-        idx_cls = walls_as_floors(classify_region(idx_bgr), idx_bgr)
+        idx_raw = classify_region(idx_bgr)
+        idx_cls = walls_as_floors(idx_raw, idx_bgr)
         idx_f = idx_cls.astype(np.float32)
+        ref_wall = (idx_raw == 5) if _ENTRANCE_METRIC == "wall" else None
 
         # 锚定档参数：引索图标在裁图内偏移(rx,ry) + 图标当尺子定尺度 s0 = r_fine/k。
         anchor = None
@@ -240,7 +309,12 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
                 anchor = (ent["cx"] - ent["box"][0], ent["cy"] - ent["box"][1],
                           r_fine / icon_k)
 
-        if anchor is not None:
+        if _ENTRANCE_METRIC == "wall":
+            # 墙重合档：**必须锚定** —— 无锚点则该种子弃权（不回退全搜，统计量不同不可比）
+            best_sc, best_s, best_mloc = (
+                _scan_seed_wall(game_wall, ref_wall, SCALES_ENT, anchor, icon_off)
+                if anchor is not None else (1e9, None, None))
+        elif anchor is not None:
             # 锚定档：钉死平移（治自相似幽灵相位），尺度仍走全域 SCALES_ENT —— 与
             # core/alignment.py 的 hint_icon 同哲学（那里注释：锚住平移后尺度交给全档扫描）。
             # 尺度窄带（s0±_ANCHOR_BAND）已废弃：s0=r_fine/k 的残差是 ~0.09 量级，窄带兜不住，
@@ -266,6 +340,17 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
                         best_s, best_mloc))
     results.sort(key=lambda x: x[0])
     return results[:top_n], icon_pos, icon_score, icon_k
+
+
+def score_desc(score) -> str:
+    """把入口分翻译成人话，供 UI 日志/状态栏。分越小越好，但含义随口径变。"""
+    if score is None:
+        return "-"
+    if _ENTRANCE_METRIC == "wall":
+        return f"墙重合{max(0.0, 1.0 - score):.0%}"
+    if _METRIC == "consistency":
+        return f"错配{score:.0%}"
+    return f"分{score:.3f}"
 
 
 def load_index(seed: int, index_dir=ENTRANCE_INDEX_DIR) -> dict | None:

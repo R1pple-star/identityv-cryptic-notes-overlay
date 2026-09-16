@@ -34,7 +34,8 @@ from core.alignment import (
     affine_from_points, auto_align_overlay, find_overlay_transform, map_to_overlay_rgba,
 )
 from core.entrance import (
-    _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance, load_index,
+    _crop_around_icon, build_sample_mask, build_entrance_transform, find_seed_by_entrance,
+    load_index, score_desc,
 )
 from core.map_library import MapLibrary
 from core.vision import detect_fog_panel, follow_features, load_bgr, panel_for_screen
@@ -429,8 +430,8 @@ class MainWindow(QWidget):
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         best = res[0]
-        self._log_step(f"入口匹配: 种子{best[1]}({best[2]}[{best[3]}]) 分{best[0]:.3f} top3="
-                       + str([(r[1], round(r[0], 3)) for r in res[:3]]), "OK")
+        self._log_step(f"入口匹配: 种子{best[1]}({best[2]}[{best[3]}]) {score_desc(best[0])} top3="
+                       + str([(r[1], score_desc(r[0])) for r in res[:3]]), "OK")
         self._after_match(shot, best, et, icon_pos, isc, res, corrected=False, dom_frac=dom)
 
     def _after_match(self, shot, best, et, icon_pos, isc, res, corrected=False, dom_frac=None):
@@ -488,7 +489,7 @@ class MainWindow(QWidget):
         self._log(et, res, icon_pos, isc, align, corrected=corrected)
         ov_txt = f"{ov:.2f}" if ov is not None else "-"
         self.status.setText(
-            f"入口{et}(图标{isc:.2f}) 入口分{sc:.3f} 重叠{ov_txt} → 种子{seed}({key}[{fl}])"
+            f"入口{et}(图标{isc:.2f}) {score_desc(sc)} 重叠{ov_txt} → 种子{seed}({key}[{fl}])"
             + (" ✓确信已对齐" if (confident and show_ok)
                else " 不确信，可手动改门/3点标定"))
 
