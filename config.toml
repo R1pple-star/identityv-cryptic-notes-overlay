@@ -6,6 +6,7 @@ map_library    = "D:/Pictures/20260818摸金地图"   # 28种子×2楼层参考�
 shot_library   = "D:/Videos/NVIDIA/IdentityV"     # 游戏截图测试样本
 assets          = "assets"                         # 项目内素材根（图标模板 + 入口引索）
 icon_template  = "assets/_icon_entrance.png"       # 白箭头入口图标模板
+nav_template   = "assets/ui_nav_column.png"        # 侧栏导航列模板（地图开合判据，见 vision.NAV_BAND）
 entrance_index = "assets/entrance_index"           # 入口引索裁图 + _index.json
 captures        = "captures"                       # 运行时截图 + log.csv（gitignore）
 eval_inbox      = "eval/inbox"                      # 用户手动纠正的失败样本回收

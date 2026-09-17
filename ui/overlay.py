@@ -47,8 +47,9 @@ class MapOverlay(QWidget):
         self._label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._label.setScaledContents(False)
 
-        # 截屏排除：防自截污染——投影墙体若进截屏会被 classify 成 structure，
-        # 地图已关时仍被 map_is_open 判「开」（跟随死锁）；热键重匹配同理吃到污染。
+        # 截屏排除：防自截污染——投影墙体若进截屏会被 classify 成 structure 混进样本/探明掩膜，
+        # 热键重匹配会吃到自己的投影（跟随的开合判定自 2026-09-17 起走导航列/雾，不再吃结构，
+        # 但**匹配**这条路径照样会被污染）。
         # 注意：winId() 已强制创建原生窗，此后不得再 setWindowFlags（重建 HWND 丢 affinity）。
         self.capture_excluded = self._set_capture_exclusion() if exclude_capture else False
 

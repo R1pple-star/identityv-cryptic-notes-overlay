@@ -3,36 +3,37 @@
 自动跟随·第一步：投影显隐跟随游戏内地图开合
 ==========================================
 纯逻辑状态机（零 Qt 依赖，离线断言见 experiments/e3_follow_state_offline.py）。
-app.py 用 QTimer 喂帧：tick 只截面板小图 → follow_features 取 雾色占比/结构占比
-→ 双特征 OR 判开/关 → feed() → 连续 FOLLOW_CONFIRM_N 帧同判才确立/翻转
-（吸收 G 开合动画的过渡帧）。
+app.py 用 QTimer 喂帧：tick 只截**地图 ROI**（面板 ∪ 右侧导航列，见 vision.map_roi）
+→ `vision.map_open_from_roi` 判开/关 → feed() → 连续 FOLLOW_CONFIRM_N 帧同判才确立/
+翻转（吸收 G 开合动画的过渡帧）。
 
-轮询边界（2026-09-14）：**只在投影可见期间轮询**（app._follow_tick 早退）——
-投影隐藏即停止一切截屏检测，游戏中 NVIDIA 截图可正常用；重开地图想看投影
-按热键重新匹配或点「显示地图」。轮询只在显示期间用于自动隐藏。
+轮询边界（2026-09-17 改：**两种「隐藏」必须分开**）：
+- **跟随判出地图关** → 投影隐藏，但**继续轮询**（降频到 FOLLOW_IDLE_INTERVAL_MS/格），
+  于是按 G 把地图开回来时能自动恢复投影（用上次的变换，不重跑匹配）。
+  旧版一隐藏就停轮询 ⇒ 关一次之后 G 再也唤不回来，只剩「点按钮」和「按热键重匹配」
+  两条路 —— 用户 2026-09-17 报的「关了按 G 也不会再开」就是这个。
+- **手动点 btn_hide 隐藏** → suspend()，**停轮询**（明确的用户意图；投影不显示时屏幕检测
+  纯属浪费）。恢复途径：点「显示地图」（resume()）或热键/重对齐出新投影（reset() 全清）。
+  首态确立（adopt）不清挂起（防跟随刚启动就覆盖用户意图）。
 
-暂停语义（suspended）：
-- 手动点 btn_hide 隐藏（跟随开启时）→ suspend()，此后 G 开合**不再自动唤起**投影；
-- 挂起中状态翻转只更新 confirmed、不返回事件（跟随知情但不驱动投影）；
-- 恢复途径：点「显示地图」（resume()）或热键/重对齐出新投影（reset() 全清）；
-- 首态确立（adopt）不清挂起（防跟随刚启动就覆盖用户意图）。
+常驻 mss 单例（ui/capture.py）之后，低频轮询不会再干扰 NVIDIA 截图 —— 2026-09-14 那个坑
+是「每 tick 新建+销毁 DC 句柄」造成的，不是「轮询」本身。
 
-判定阈值（2026-09-14 实测，63 开态 + 4 疑似关态）：
-- struct = (cls2房间|cls3通路) 占比：开态 min 0.21 / med 0.44，关态 max 0.017
-  → 阈值 0.10 取分离带中。旧 content(亮度≥42占比) 单特征已证不可用：关态游戏画面
-  （Alt/F 键特效）实测冲到 0.31，跨过旧阈值 0.225 误开关投影。
-- fog = FOG_BGR tol24 色距占比：关态 ≤0.002；重度探明开态可低至 0.001（雾开完了）
-  → fog 只作第二特征与 struct OR，覆盖两端（雾多/结构多任一显著即判开）。
-- 复标：补拍关态截图（含 Alt/F 误触发场景）进 captures/follow_closed/ 后跑
-  experiments/e2_map_open_calib.py。
+判定阈值（2026-09-17 换判据，实测见 core/vision.py 的 NAV_BAND 长注）：
+开 ⇔ 侧栏导航列 NCC ≥ NAV_NCC_MIN(0.45) **或** 雾占比 ≥ FOG_OPEN_MIN(0.30)。
+**结构占比退出判定**：游戏世界实测能到 0.51，旧阈 0.10 会被跨过 ⇒ 判开误判，投影留在地图
+关着的画面上（用户报的「按 G 关地图不灵敏」）。导航列是「高精度低召回」，所以雾兜底必须留。
 """
 from __future__ import annotations
 
-FOLLOW_INTERVAL_MS = 250          # 轮询周期（只截面板小图，主线程占空比低；仅投影可见期间运行）
+FOLLOW_INTERVAL_MS = 250          # 轮询周期（投影可见期间；只截地图 ROI 小图，主线程占空比低）
+FOLLOW_IDLE_INTERVAL_MS = 1000    # 跟随自动隐藏后的降频周期（等 G 把地图开回来；见模块头）
 FOLLOW_CONFIRM_N = 2              # 连续同判帧数（防抖；最坏响应 ≈ 2 tick + 相位 ≈ 0.75s）
-FOLLOW_FOG_THRESH = 0.10          # 雾色占比开闸阈值（e2 复标口径，见模块头）
-FOLLOW_STRUCT_THRESH = 0.10       # 结构(cls2|cls3)占比开闸阈值（开态min0.21/关态max0.017 取中）
 FOLLOW_MAX_CAPTURE_ERRORS = 10    # 连续截屏异常上限，达到即停跟随
+
+# 开合阈值不在本模块：判定走 vision.map_open_from_roi（NAV_NCC_MIN / FOG_OPEN_MIN）。
+# 曾在此处的 FOLLOW_FOG_THRESH/FOLLOW_STRUCT_THRESH 双特征已删（2026-09-17）——阈值只有
+# 一处可调，避免两套口径漂移。
 
 
 class FollowState:

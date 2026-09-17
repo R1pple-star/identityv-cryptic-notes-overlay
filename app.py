@@ -37,10 +37,11 @@ from core.entrance import (
     load_index, score_desc,
 )
 from core.map_library import MapLibrary
-from core.vision import detect_fog_panel, follow_features, load_bgr, panel_for_screen
+from core.vision import (FOG_OPEN_MIN, NAV_NCC_MIN, detect_fog_panel, load_bgr,
+                         map_is_open, map_open_from_roi, map_roi, panel_for_screen)
 from ui.capture import capture_monitor, capture_region
 from ui.follow import (
-    FOLLOW_FOG_THRESH, FOLLOW_INTERVAL_MS, FOLLOW_STRUCT_THRESH, FollowState,
+    FOLLOW_IDLE_INTERVAL_MS, FOLLOW_INTERVAL_MS, FollowState,
 )
 from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
@@ -204,7 +205,9 @@ class MainWindow(QWidget):
         self._follow_timer: QTimer | None = None
         self._follow_panel = None
         self._follow_err = 0
-        self._follow_poll_paused = False  # 投影隐藏导致的轮询暂停（一次性日志防刷屏）
+        self._follow_poll_paused = False  # 手动隐藏导致的轮询暂停（一次性日志防刷屏）
+        self._follow_idle = 0             # 自动隐藏期间的降频计数（每 N 格才真截一次）
+        self._last_rgba = None            # 上次成功投影的整屏 RGBA（G 重开地图时原样放回）
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -374,6 +377,13 @@ class MainWindow(QWidget):
         if panel is None:
             self._log_step(f"屏幕 {shot.shape[1]}×{shot.shape[0]} 未适配（非16:9且未校准；"
                            "config.toml [panel.rects] 可加校准）", "ERROR")
+            return
+        # 地图画面闸（CLAUDE.md 待办 3）：大厅/结算/桌面等非地图画面按下热键，跑完入口匹配
+        # 只会给出一个**无意义却看着挺像**的种子。判据与跟随同源（导航列 NCC 或 雾兜底），
+        # 见 core/vision.py 的 NAV_BAND 长注。此处只记日志、不动投影（跟随自己会隐）。
+        opened, why = map_is_open(shot, panel)
+        if not opened:
+            self._log_step(f"不是地图画面（{why}）→ 先按 g 打开游戏地图、刚进入口再按热键", "WARN")
             return
         et = self.entrance_combo.currentText()
         res, icon_pos, isc, icon_k = find_seed_by_entrance(shot, self.lib, et, panel=panel, top_n=3)
@@ -625,8 +635,24 @@ class MainWindow(QWidget):
                 self._log_step("投影未能排除截屏（跟随/重匹配可能受自污染）", "WARN")
         self.overlay.set_image(rgba)
         self.overlay.setWindowOpacity(self.opacity_slider.value() / 100.0)
+        self._last_rgba = rgba      # 供跟随「G 重开地图」时原样放回（见 _restore_overlay）
         self._set_overlay_visible(True)
         self._follow.reset()  # 新投影=「我现在要投影」：清跟随挂起与确认态，重新 adopt
+
+    def _restore_overlay(self) -> bool:
+        """地图被 G 重新打开 ⇒ 直接用**上次渲染好的投影**恢复显示，不重跑匹配。
+
+        投影早已按上次的变换烘焙成整屏 RGBA，原样放回即与关图前逐像素一致 —— 比重新跑
+        一遍入口匹配+两段式对齐快得多，也不会因为门口探明没变而白跑一遍。
+        ⚠️ 关图期间地图若平移/缩放过，恢复的就是**旧位置**：要更新请按热键重匹配。
+        上次没成功投影过（被判过拒答/藏图）⇒ 不恢复，只提示按热键（宁可什么都不给）。
+        """
+        if self._last_rgba is None:
+            self._log_step("地图已开，但上次没有成功投影 ⇒ 不自动恢复（请按热键匹配）", "WARN")
+            return False
+        self._show_overlay(self._last_rgba)
+        self._log_step("地图已开 → 投影已恢复（沿用上次的变换；地图若已移动请按热键重匹配）", "OK")
+        return True
 
     def _show_sample_preview(self, bgr):
         """显示匹配用的入口样本（让玩家看到选对没），贴主窗右侧。"""
@@ -650,6 +676,7 @@ class MainWindow(QWidget):
         「▶ 按此种子对齐」（全搜）或「✋ 手动选点重合」（3 点标定）。
         """
         self._set_overlay_visible(False)
+        self._last_rgba = None  # 清掉：跟随「G 重开地图」不许把上一张被否掉的投影放回来
         self._log_step(f"不投影：{why}｜入口判定 {label}（位置未验证，仅供参考）", "WARN")
 
     def _hide_overlay(self):
@@ -699,8 +726,9 @@ class MainWindow(QWidget):
             self._follow_timer.setInterval(FOLLOW_INTERVAL_MS)
             self._follow_timer.timeout.connect(self._follow_tick)
         self._follow_timer.start()
-        self._log_step(f"自动跟随已开启：面板 {tuple(panel)} @ {FOLLOW_INTERVAL_MS}ms（仅投影可见期间轮询，"
-                       f"隐藏即停不扰 NVIDIA 截图），开闸: 雾≥{FOLLOW_FOG_THRESH} 或 结构≥{FOLLOW_STRUCT_THRESH}", "OK")
+        self._log_step(f"自动跟随已开启：面板 {tuple(panel)} @ {FOLLOW_INTERVAL_MS}ms（地图关后降频到 "
+                       f"{FOLLOW_IDLE_INTERVAL_MS}ms 继续等 G 开回来，手动隐藏才停），"
+                       f"开闸: 导航列≥{NAV_NCC_MIN} 或 雾≥{FOG_OPEN_MIN}", "OK")
 
     def _stop_follow(self):
         if self._follow_timer is not None and self._follow_timer.isActive():
@@ -714,20 +742,31 @@ class MainWindow(QWidget):
         # 模态对话框/QMenu 是嵌套事件循环，QTimer 照常触发——期间不判定
         if QApplication.activeModalWidget() or QApplication.activePopupWidget():
             return
-        # 只在投影可见期间轮询：隐藏即停止一切截屏检测（游戏中 NVIDIA 截图可正常用，
-        # 2026-09-14 用户实测旧版常驻轮询干扰英伟达截屏）。重开地图想看投影按热键
-        # 重新匹配或点「显示地图」。见 ui/follow.py 模块头。
-        if self.overlay is None or not self.overlay.isVisible():
-            if self.overlay is not None and not self._follow_poll_paused:
-                self._follow_poll_paused = True
-                self._log_step("投影已隐藏，跟随检测暂停（NVIDIA 截图可用；"
-                               "重开地图请按热键或点『显示地图』）")
+        if self.overlay is None:
             self._follow.idle_reset()
             return
-        self._follow_poll_paused = False
-        px, py, pw, ph = self._follow_panel
+        # 两种「投影不在」必须分开（2026-09-17，用户报「关了按 G 也不会再开」）：
+        #   手动隐藏 = 明确的用户意图 ⇒ 停一切屏幕检测；
+        #   跟随判出地图关 = 只是「现在看不到」⇒ 降频续看，等 G 把地图开回来。
+        # 旧版两者都早退 ⇒ 关一次地图之后 G 再也唤不回投影，只能点按钮或按热键重匹配。
+        visible = self.overlay.isVisible()
+        if not visible and self._follow.suspended:
+            if not self._follow_poll_paused:
+                self._follow_poll_paused = True
+                self._log_step("投影已手动隐藏，跟随检测暂停（点『显示地图』或按热键恢复）")
+            self._follow.idle_reset()
+            return
+        if visible:
+            self._follow_poll_paused = False
+            self._follow_idle = 0
+        else:
+            self._follow_idle += 1
+            if self._follow_idle % max(1, FOLLOW_IDLE_INTERVAL_MS // FOLLOW_INTERVAL_MS):
+                return
         try:
-            crop = capture_region(px, py, pw, ph)
+            # 截「面板 ∪ 右侧导航列」——一次截屏同时够算导航列 NCC 与面板雾特征
+            rx0, ry0, rx1, ry1 = map_roi(self._follow_panel)
+            roi = capture_region(rx0, ry0, rx1 - rx0, ry1 - ry0)
         except Exception as e:  # noqa: BLE001
             self._follow_err += 1
             if self._follow_err == 1:
@@ -737,9 +776,8 @@ class MainWindow(QWidget):
                 self._stop_follow()
             return
         self._follow_err = 0
-        # 双特征判定（旧 content 单特征会被 Alt/F 等画面亮度变化误触发，见 follow.py 模块头）
-        content, fog, struct = follow_features(crop)
-        is_open = (fog >= FOLLOW_FOG_THRESH) or (struct >= FOLLOW_STRUCT_THRESH)
+        # 判据：侧栏导航列 NCC（主）或 雾占比（兜底）——结构占比已退出判定，见 vision.NAV_BAND
+        is_open, why = map_open_from_roi(roi, self._follow_panel)
         evt = self._follow.feed(is_open)
         if evt is None:
             return  # 静默：稳定态/防抖中不刷日志
@@ -747,10 +785,14 @@ class MainWindow(QWidget):
         if self._follow.suspended:
             self._log_step(f"跟随暂停中（地图{'开' if state else '关'}），不动投影")
             return
-        if self.overlay.isVisible() != state:
-            self._set_overlay_visible(state)
-        self._log_step(f"跟随: 地图{'开' if state else '关'} → 投影{'显示' if state else '隐藏'}"
-                       f"（雾{fog:.2f} 结构{struct:.2f} 亮度{content:.2f}）")
+        restored = True
+        if state and not self.overlay.isVisible():
+            restored = self._restore_overlay()   # G 把地图开回来 ⇒ 放回上次的投影
+        elif not state and self.overlay.isVisible():
+            self._set_overlay_visible(False)
+        if restored:
+            self._log_step(f"跟随: 地图{'开' if state else '关'} → "
+                           f"投影{'显示' if state else '隐藏'}（{why}）")
 
     # ---- 失败回收（§6.3）：log.csv + inbox ----
     def _log(self, entrance_type, res, icon_pos, isc, align, corrected: bool):

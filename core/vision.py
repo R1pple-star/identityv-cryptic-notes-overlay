@@ -27,6 +27,7 @@ def _load_config():
     defaults = {
         "panel_rect": (668, 166, 1064, 569),
         "icon_template": "_icon_entrance.png",
+        "nav_template": "assets/ui_nav_column.png",
     }
     try:
         with open(_CONFIG_PATH, "rb") as f:
@@ -36,6 +37,7 @@ def _load_config():
         defaults["panel_rects"] = {k: tuple(v)
                                    for k, v in cfg["panel"].get("rects", {}).items()}
         defaults["icon_template"] = cfg["paths"]["icon_template"]
+        defaults["nav_template"] = cfg["paths"].get("nav_template", defaults["nav_template"])
     except Exception:
         pass
     return defaults
@@ -89,6 +91,8 @@ def detect_fog_panel(bgr_screen: np.ndarray):
 
 # 入口图标模板路径（config.paths.icon_template，相对项目根解析为绝对路径）。
 ICON_TEMPLATE = (ROOT / _CFG["icon_template"]).resolve()
+# 侧栏导航列模板（config.paths.nav_template）—— 地图开合判据用，见下方 NAV_BAND 长注。
+NAV_TEMPLATE = (ROOT / _CFG["nav_template"]).resolve()
 
 
 def load_bgr(path: str) -> np.ndarray:
@@ -291,9 +295,10 @@ def follow_features(region):
 
     content = 非暗像素占比(cls≠0)——仅日志展示，不参与判定（游戏画面亮度变化会误判，
     2026-09-14 实测关态 Alt/F 特效 content 冲到 0.31 跨过旧阈值）；
-    fog    = FOG_BGR tol24 色距占比（关态 ≤0.002；重度探明开态可低至 0.001）；
-    struct = (cls2房间|cls3通路) 占比（开态 min 0.21 / 关态 max 0.017，主判据）。
-    判定规则在 ui/follow.py：fog ≥ FOLLOW_FOG_THRESH 或 struct ≥ FOLLOW_STRUCT_THRESH。
+    fog    = FOG_BGR tol24 色距占比（开态 0.20~0.69；游戏世界最高 0.17）；
+    struct = (cls2房间|cls3通路|cls5墙) 占比——**2026-09-17 起不再参与开合判定**，仅日志：
+    游戏世界实测能到 0.21，旧阈 0.10 会被跨过而误判为「开」（见 NAV_BAND 长注）。
+    开合判定现走 map_is_open / map_open_from_roi（侧栏导航列 NCC 为主判据）。
     """
     cls = classify_region(region)
     content = float((cls != 0).mean())
@@ -302,14 +307,107 @@ def follow_features(region):
     return content, fog, struct
 
 
-def map_is_open(shot_bgr, panel=FIXED_PANEL, icon_template=None):
-    """地图是否打开：面板里须有「迷宫内容」（迷雾 或 通路/房间/墙 结构），而非一般游戏画面。
+# ---- 地图开合判据（2026-09-17 换口径：侧栏导航列）--------------------------------
+# 侧栏导航列 = 地图画面**独有**的固定 UI（ESC / 导航至出口 / 门箭头圆钮 / + 圆钮 / 竖滑条），
+# 位于**面板之外**（面板右缘 1732，列在 1736~1900）⇒ 位置与外观都固定，是个二值信号。
+# 用户 2026-09-17 提议「用侧面 UI 判断地图是否开启」。
+#
+# ⚠️ 实测（experiments/e29_closed_scan.py / e30_map_open_gate.py / e31_nav_calib.py，176 张）：
+#   **导航列是「高精度、低召回」** —— 不是每张开态图都量得到它：
+#     09-16 22:xx、09-14 21:xx 等场次 NCC 0.86~1.00（定点、无位移）；
+#     但 09-09~09-16 17:xx 的**大量确凿开态图**只有 0.03~0.16（怀疑 UI 层淡出/未绘制或
+#     整体位移；邻域 ±40/±30 搜索也没救回来：17.11 定点 0.36 → 搜索 0.664，而真负样本
+#     同时被抬到 0.271，分离带反而更窄，故**不做位置搜索**）。
+#   已人工逐张确认的负样本（游戏世界 3 / 结算 / 登录 / 桌面 / 黑屏）定点 NCC **最高 0.271**。
+#   所以：NCC ≥ 此闸 ⇒ 判开**可信**；NCC 低**不能**判关 —— 必须靠雾兜底。
+#
+# 旧判据（雾≥0.10 或 结构≥0.10）在同一批数据上的**实测误判**：
+#   08.25 木楼梯(雾0.00 结构0.21)、09.14 走廊(雾0.17)、08.25 吊灯场景(结构**0.51**)、
+#   09.14 登录画面(结构0.52) → 全被判成「开」⇒ 地图关着投影却留在画面上，
+#   即用户报的「按 G 关地图不灵敏」。**故结构占比整个退出判定**（它是最脏的一路）。
+# 雾兜底阈值同时从 0.10 上调到 0.30：负样本实测最高 0.17（旧阈 0.10 会被它跨过）。
+NAV_BAND = (4, -106, 164, 740)   # 相对面板: (右缘起dx, 顶起dy, 宽, 高)，随面板宽等比缩放
+NAV_NCC_MIN = 0.45               # 负样本最高 0.271 / 可信正样本最低 0.543 ⇒ 取中，两侧各留 ≥0.17
+FOG_OPEN_MIN = 0.30              # 雾兜底：开态实测 0.20~0.69（兜底那一批全 ≥0.42）；负样本最高 0.17
 
-    大厅/游戏场景/结算界面 没有迷宫结构，应判为未打开。
-    返回 (bool, 迷宫内容占比)。跟随的可靠判定请用 follow_features 双特征（见其注释）。
+_NAV_TPL_CACHE: dict = {}
+
+
+def _nav_template():
+    """导航列模板（懒加载 + 常驻缓存——跟随每秒都要用，不能每次读盘）。"""
+    key = str(NAV_TEMPLATE)
+    if key not in _NAV_TPL_CACHE:
+        _NAV_TPL_CACHE[key] = load_bgr(key) if NAV_TEMPLATE.exists() else None
+    return _NAV_TPL_CACHE[key]
+
+
+def nav_band(panel=FIXED_PANEL):
+    """侧栏导航列的屏幕矩形 (x0, y0, x1, y1)，随面板宽等比缩放（多分辨率）。"""
+    px, py, pw, _ph = panel
+    k = pw / float(FIXED_PANEL[2])
+    dx, dy, w, h = NAV_BAND
+    x0, y0 = px + pw + int(round(dx * k)), py + int(round(dy * k))
+    return x0, y0, x0 + int(round(w * k)), y0 + int(round(h * k))
+
+
+def map_roi(panel=FIXED_PANEL):
+    """地图画面 ROI (x0, y0, x1, y1) = 面板 ∪ 导航列。
+
+    跟随每 tick 只截这一块：既够算面板的雾特征，也够算导航列的 NCC，一次截屏两用。
     """
     px, py, pw, ph = panel
-    region = shot_bgr[py:py + ph, px:px + pw]
-    content, _fog, _struct = follow_features(region)
-    return content > 0.12, content
+    nx0, ny0, nx1, ny1 = nav_band(panel)
+    return min(px, nx0), min(py, ny0), max(px + pw, nx1), max(py + ph, ny1)
+
+
+def roi_of(shot_bgr, panel=FIXED_PANEL):
+    """从全屏图裁出 map_roi。"""
+    x0, y0, x1, y1 = map_roi(panel)
+    return shot_bgr[y0:y1, x0:x1]
+
+
+def nav_column_ncc(roi_bgr, panel=FIXED_PANEL):
+    """ROI 内导航列与模板的灰度 NCC ∈[-1,1]；模板缺失/ROI 太小返回 None（调用方退回雾判据）。"""
+    tpl = _nav_template()
+    if tpl is None:
+        return None
+    nx0, ny0, nx1, ny1 = nav_band(panel)
+    rx, ry, _x1, _y1 = map_roi(panel)
+    band = roi_bgr[ny0 - ry:ny1 - ry, nx0 - rx:nx1 - rx]
+    if band.size == 0:
+        return None
+    if band.shape != tpl.shape:
+        tpl = cv2.resize(tpl, (band.shape[1], band.shape[0]))
+    a = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    b = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    a, b = a - a.mean(), b - b.mean()
+    d = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum()))
+    return float((a * b).sum() / d) if d > 1e-6 else 0.0
+
+
+def map_open_from_roi(roi_bgr, panel=FIXED_PANEL):
+    """地图画面是否打开（ROI 版，返回 (bool, 依据字符串)）。
+
+    主判据 = 导航列 NCC ≥ NAV_NCC_MIN；导航列模板缺失时退回 雾 ≥ FOG_OPEN_MIN。
+    """
+    ncc = nav_column_ncc(roi_bgr, panel)
+    px, py, pw, ph = panel
+    rx, ry, _x1, _y1 = map_roi(panel)
+    region = roi_bgr[py - ry:py - ry + ph, px - rx:px - rx + pw]
+    fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24).mean())
+    if ncc is None:
+        return fog >= FOG_OPEN_MIN, f"导航列模板缺失→雾{fog:.2f}"
+    if ncc >= NAV_NCC_MIN:
+        return True, f"导航列{ncc:.2f}"
+    if fog >= FOG_OPEN_MIN:
+        return True, f"导航列{ncc:.2f}偏低→雾{fog:.2f}兜底"
+    return False, f"导航列{ncc:.2f} 雾{fog:.2f}"
+
+
+def map_is_open(shot_bgr, panel=FIXED_PANEL):
+    """地图画面是否打开（全屏图版）。返回 (bool, 依据字符串)。
+
+    热键路径在跑匹配前用它拒掉大厅/结算等非地图画面（CLAUDE.md 待办 3）。
+    """
+    return map_open_from_roi(roi_of(shot_bgr, panel), panel)
 
