@@ -3,6 +3,8 @@
 单一评估 harness
 ================
 在「刚进入口」标注集(eval/labels.csv)上跑入口引索匹配 + 两段式对齐，报：
+  [!] 分母只算「应答的那几张」—— 拒答被排除在外，头条数字偏乐观。
+  用户真实体验看 experiments/e26_e2e_truth.py（"按下热键后屏幕上出现的东西"）。
   主集(is_entrance_view=1) top-1/top-3 准确率 + overlap 闸通过率
   控制组(is_entrance_view=0) 误报率(不该确信却确信了)
 路径从 config 读。每改动对着它跑(见 CLAUDE.md)。
@@ -192,7 +194,7 @@ def main():
     answered = main_n - main_rej
     print(f"\n主集(刚进入口): 应答 top-1 {main_t1}/{answered}  top-3 {main_t3}/{answered}  "
           f"overlap闸通过 {main_gate}/{answered}  匹配退化 {main_deg}/{answered}")
-    print(f"  正确拒绝(未探明mask<{SAMPLE_MASK_MIN:.0%}, app拒答) {main_rej}/{main_n}"
+    print(f"  拒答(结构闸挡下，真实通过率看 experiments/e26_e2e_truth.py) {main_rej}/{main_n}"
           " —— 不计入应答分母")
     ctrl_ans = ctrl_n - ctrl_rej
     fp_rate = (ctrl_fp / ctrl_ans) if ctrl_ans else 0
