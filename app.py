@@ -39,9 +39,9 @@ from core.entrance import (
     load_index, score_desc,
 )
 from core.map_library import MapLibrary
-from core.vision import (FOG_OPEN_MIN, NAV_NCC_MIN, detect_fog_panel, load_bgr,
+from core.vision import (_find_icon, FOG_OPEN_MIN, NAV_NCC_MIN, detect_fog_panel, load_bgr,
                          map_is_open, map_open_from_roi, map_roi, panel_for_screen,
-                         zoom_scale_from_roi)
+                         zoom_scale_from_k, zoom_scale_from_roi)
 from ui.capture import capture_monitor, capture_region, monitor_size
 from ui.follow import (
     FOLLOW_IDLE_INTERVAL_MS, FOLLOW_INTERVAL_MS, FollowState,
@@ -51,8 +51,9 @@ from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
 from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
-from ui.track import (TRACK_IDLE_INTERVAL_MS, TRACK_LOG_MIN_SEC, TRACK_LOST_MAX,
-                      TRACK_MOTION_MAD, TRACK_NEAR_R, TRACK_OK, Tracker, verdict)
+from ui.track import (TRACK_ICON_SCORE_MIN, TRACK_IDLE_INTERVAL_MS, TRACK_LOG_MIN_SEC,
+                      TRACK_LOST_MAX, TRACK_MOTION_MAD, TRACK_NEAR_R, TRACK_OK, Tracker,
+                      ruler_slop, verdict)
 
 # DPI 缩放适配：让进程用物理像素（per-monitor DPI aware + Qt 禁用 high-DPI scaling），
 # 使 mss 截屏、Qt 窗口坐标、面板坐标(panel_for_screen) 三者统一于物理像素。否则 125%/150% 缩放下
@@ -913,8 +914,20 @@ class MainWindow(QWidget):
             self._log_step(f"跟踪：参考图读不出（{e}）→ 停止跟踪", "WARN")
             tr.reset(); return
 
-        # 尺度：滑条实测值优先。对齐分选不出尺度（vision.ZOOM_TABLE_* 长注 + CLAUDE.md ⑥）
+        # 尺度：两个「量出来的」源，优先级 滑条(1ms,±0.01) > 图标尺子(200ms,±0.05/k)。
+        # 对齐分选不出尺度（vision.ZOOM_CURVE_C 长注 + CLAUDE.md ⑥）。
         s_ui, why_s = zoom_scale_from_roi(roi, self._follow_panel)
+        s_src = "滑条"
+        if s_ui is None:
+            # 备用源：图标尺子 s≈0.374/k。要 200ms，故只在滑条读不到时才量。
+            _ip, isc_i, k_i = _find_icon(roi, px - rx, py - ry, pw, ph)
+            s_k = zoom_scale_from_k(k_i) if (isc_i or 0) >= TRACK_ICON_SCORE_MIN else None
+            if s_k is None:
+                why_s = f"{why_s}；图标尺子也不可用(分{isc_i:.2f})"
+            elif abs(s_k - tr.s) > ruler_slop(s_k, k_i):
+                s_ui, s_src = s_k, "图标尺子"      # 变化超出尺子自身精度 ⇒ 确实缩放了
+            else:
+                s_ui, s_src = tr.s, "沿用上次"      # 尺子与旧尺度一致 ⇒ 保留更精确的旧值
         scale_moved = s_ui is not None and abs(s_ui - tr.s) > TRACK_DEADBAND_S
 
         # 1) 尺度没变：先试上次位置附近的小窗（半径 < 半个迷宫格周期 ⇒ 窗内不可能有幽灵相位）
@@ -929,12 +942,21 @@ class MainWindow(QWidget):
                 return
         # 尺度变了就不走小窗：在**错尺度**上小窗也能找到低分位置（实测假接受，图标偏 78~180px）
 
+        # 1.5) 一个尺度源都没有 ⇒ **不做全平移，就地判丢**。没有可信尺度时，全平移的全局极小
+        #      会落在错位置上，而且**错尺度分更低**（2026-09-18 实测：真尺度 0.42 全局极小
+        #      0.086，错尺度 0.30 反而 0.126、图标偏 840px）⇒ 没有任何分数闸能分辨。
+        #      小窗（±12px）是有界的、且要过 TRACK_OK 才采纳，所以上面试完就可以收手了；
+        #      连丢 TRACK_LOST_MAX 次会隐藏投影 —— 与「宁可什么都不给」一致（待办 1）。
+        if s_ui is None:
+            self._track_lost(f"没有可信的尺度（{why_s}）")
+            return
+
         # 2) 上一帧位置对不上了 ⇒ 换尺度做单尺度全平移。候选**按优先级**逐个试、谁先过闸用谁；
         #    **绝不"挑分最小的那个尺度"** —— 分对 s 单调偏低（技术备忘⑥），滑条值 0.35 与旧值
         #    0.31 同场竞逐时挑分必选 0.31，于是又滑回旧尺度、投影偏 26px。
-        cands = [s_ui] if s_ui is not None else []
-        if s_ui is None or abs(s_ui - tr.s) > 0.02:
-            cands.append(tr.s)
+        cands = [s_ui]
+        if abs(s_ui - tr.s) > 0.02:
+            cands.append(tr.s)      # 兜底：滑条读数万一读错（圆点串到别的行），别把旧尺度丢了
         for s in cands:
             r = find_overlay_transform(None, ref, self._follow_panel, region=region,
                                        hint_s=s, fast=True, ref_key=tr.ref_path)
@@ -943,11 +965,11 @@ class MainWindow(QWidget):
             v = verdict(sc_near, r[1], r[2])
             if v == "accept":
                 self._track_adopt(r[0], float(s), f"重对齐 尺度{s:.2f}"
-                                                    f"{'（滑条）' if s == s_ui else '（沿用上次）'}")
+                                  f"（{s_src if s == s_ui else '沿用上次'}）")
                 return
             if v == "keep":
                 tr.note_ok(); return
-        self._track_lost(f"证据不足（候选尺度 {[round(c, 3) for c in cands]} 都不过闸）")
+        self._track_lost(f"证据不足（候选尺度 {[round(c, 3) for c in cands]} 都不过闸；{why_s}）")
 
     def _track_adopt(self, M, s, why):
         """接受新变换：过死区才重烘焙投影（省掉一次 warpAffine 1920×1080 + QPixmap）。"""

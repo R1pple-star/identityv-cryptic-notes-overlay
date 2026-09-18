@@ -352,12 +352,15 @@ def nav_band(panel=FIXED_PANEL):
 
 
 def map_roi(panel=FIXED_PANEL):
-    """地图画面 ROI (x0, y0, x1, y1) = 面板 ∪ 导航列。
+    """地图画面 ROI (x0, y0, x1, y1) = 面板 ∪ 导航列（∪ 圆点读数带）。
 
     跟随每 tick 只截这一块：既够算面板的雾特征，也够算导航列的 NCC，一次截屏两用。
+    ⚠️ 纵向要按 `NAV_DOT_BAND_H` 加长：滑条圆点会跑到 NCC 带（740）之外，裁短了读不到
+    最缩小态（2026-09-18，见 NAV_DOT_RANGE 长注）。只加长 ROI，NAV_BAND 本身不动。
     """
     px, py, pw, ph = panel
     nx0, ny0, nx1, ny1 = nav_band(panel)
+    ny1 = max(ny1, ny0 + int(round(NAV_DOT_BAND_H * (nx1 - nx0) / float(NAV_BAND[2]))))
     return min(px, nx0), min(py, ny0), max(px + pw, nx1), max(py + ph, ny1)
 
 
@@ -419,23 +422,50 @@ def map_is_open(shot_bgr, panel=FIXED_PANEL):
 # 下界 0.30 截住；而游戏最放大时真尺度是 0.25。滑条直接给出当前缩放，绕开这一整条病根。
 #
 # 几何：滑条在导航列里，轨道是那条亮细竖条（模板内 x=NAV_TRACK_X），圆点=轨道上又亮又宽的
-# 峰。实测模板（7 张全屏实机图的均值）轨道列 x=84，圆点只在 y∈[380,730] 内活动。
-#
-# 标定（experiments/e37_video_zoom.py）：拿用户录的 15.9s 缩放演示视频逐帧读圆点，再对每帧
-# 做**逐尺度图标锚点扫描**求真值（引索 json 的图标 cx/cy ↔ `_find_icon` 的屏幕坐标；真对齐
-# 必须把前者映到后者）。11 个点、图标误差 1~22px、单调：
-#     圆点y  382  421  440 | 464  483  522 | 550 | 589 | 646 | 651 | 708
-#     s     0.25 0.25 0.25| 0.30 0.30 0.30|0.35 |0.40 |0.45 |0.50 |0.60
-# **全种子通用**（种子 2/6/10/13 在同一圆点处得到同一 s）：圆点是游戏 UI，参考素材又是同一
-# 渲染器、同一归一化尺度。圆点越靠下 s 越大（`+` 钮在顶 ⇒ 往上 = 放大）。
-# ⚠️ 只在**全屏**布局可用：窗口化时导航列整体位移（nav_column_ncc 掉到 0.34），读数无意义。
-# 故要求导航列 NCC 过闸才认，且调用方必须有回退路径。
+# 峰。实测模板（7 张全屏实机图的均值）轨道列 x=84，圆点活动范围 y∈[315,805]。
+# ⚠️ 这个范围 2026-09-18 由 (380,730) 放宽：用户报「缩大小不准」，4 帧只改缩放的演示证明
+# 圆点能走到 **y=752**（真尺度 0.83），而旧窗到 730 就截住 ⇒ 最缩小态**读数直接失败**
+# （峰-基只剩 4，过不了闸），跟随于是拿旧尺度去做全平移搜索（实测图标偏 184px，见 e45）。
+# 轨道实体一直延伸到 y≈790，再往下是底部圆钮（全览/我的位置，y≥860）——别把窗开过头。
 NAV_TRACK_X = 84                 # 滑条轨道列（模板内坐标）
-NAV_DOT_RANGE = (380, 730)       # 圆点可活动的 y 段（模板内坐标）
+NAV_DOT_RANGE = (315, 805)       # 圆点可活动的 y 段（模板内坐标）
+NAV_DOT_BAND_H = 820             # 圆点读数要裁的导航列高度：比 NAV_BAND 的 740 深 80px
+                                 # （圆点会跑到 NCC 带之外）。只加深**读数**的裁切、不动
+                                 # NAV_BAND —— 后者一高，nav_column_ncc 就会 resize 模板，
+                                 # NCC 闸的标定（0.45）与 e30/e31/e32 全部作废。
 ZOOM_DOT_MIN = 15.0              # 圆点峰须高出轨道基线这么多才算读到了（否则判读数失败）
-# 圆点 y → 尺度 s 的标定表（模板内坐标，y 必须单调递增）
-ZOOM_TABLE_Y = (382, 421, 440, 464, 483, 522, 550, 589, 646, 651, 708)
-ZOOM_TABLE_S = (0.25, 0.25, 0.25, 0.30, 0.30, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60)
+# 圆点 y → 尺度 s 的曲线：`ln s = Σ c_i·t^i`，t=(y−560)/200（y 先钳到 [375,755]）。
+# 2026-09-18 重标定（experiments/e46_slider_recalib.py + e39/e44/e45）：
+#   **真值锚点**（图标锚点法，图标误差 1~5px —— 引索 json 的图标 cx/cy 经 M 映到 `_find_icon`
+#   实测的屏幕位置）5 点：(382,0.230) (488,0.300) (589,0.395) (627,0.430) (752,0.830)
+#   **图标尺子** `s≈0.374/k` 的中位（75 张全屏帧；k 量化 ±0.05 ⇒ 该源自身 ±0.05/k）7 点：
+#     (545,0.325) (550,0.340) (584,0.374) (646,0.440) (685,0.528) (713,0.636) (728,0.701)
+#   三阶拟合残差：锚点 −0.000/+0.001/−0.015/−0.002/−0.004，尺子 +0.016/+0.004/+0.001/
+#   +0.019/+0.018/+0.000/−0.002。
+#   旧表（09-17 视频 11 点）只覆盖 y∈[382,708]，尾段还偏低：表在 708 处给 0.60，真值是 0.83
+#   —— 「缩大小不准」的另一半就在这里。
+#   ⚠️ y>755 没有测量（滑条最下档停在 752），曲线在那里外推不可信 ⇒ 钳住不外推。
+ZOOM_CURVE_C = (-1.042, 0.48454, 0.20267, 0.22509)
+ZOOM_DOT_Y_CLAMP = (375.0, 755.0)
+# 图标尺子：`s ≈ ICON_RULER_C / k`（k = `_find_icon` 的获胜尺度）。滑条的**备用尺度源**——
+# 导航列读不到时（窗口化布局/UI 动画）仍可用，代价是 `_find_icon` 约 200ms。
+# 依据：5 个图标锚点真值上 `0.374/k` 全部落在 ±0.011 内；75 张全屏帧的 (圆点y, 0.374/k)
+# 与上表单调一致。**与分辨率无关**：它是「图标在参考图里的像素数 ÷ 模板像素数」，两者都不随
+# 屏幕分辨率变。
+ICON_RULER_C = 0.374
+
+
+def zoom_scale_from_k(k):
+    """图标尺子：由 `_find_icon` 的获胜尺度 k 反推 s。k 为 None/非正 ⇒ None。"""
+    if not k or k <= 0:
+        return None
+    return ICON_RULER_C / float(k)
+
+
+def _dot_y_to_s(y):
+    """圆点 y（模板内坐标）→ 尺度 s（曲线来源见 ZOOM_CURVE_C 长注）。"""
+    t = (min(max(float(y), ZOOM_DOT_Y_CLAMP[0]), ZOOM_DOT_Y_CLAMP[1]) - 560.0) / 200.0
+    return float(np.exp(sum(c * t ** i for i, c in enumerate(ZOOM_CURVE_C))))
 
 
 def nav_dot_y(roi_bgr, panel=FIXED_PANEL):
@@ -444,6 +474,7 @@ def nav_dot_y(roi_bgr, panel=FIXED_PANEL):
     读不到（ROI 太小/全黑）返回 (None, 0.0)。质量分给调用方自己判（< ZOOM_DOT_MIN 别用）。
     """
     nx0, ny0, nx1, ny1 = nav_band(panel)
+    ny1 = ny0 + int(round(NAV_DOT_BAND_H * (nx1 - nx0) / float(NAV_BAND[2])))
     rx, ry, _x1, _y1 = map_roi(panel)
     band = roi_bgr[ny0 - ry:ny1 - ry, nx0 - rx:nx1 - rx]
     if band.size == 0:
@@ -477,10 +508,10 @@ def zoom_scale_from_roi(roi_bgr, panel=FIXED_PANEL):
         return None, "导航列 ROI 太小"
     if q < ZOOM_DOT_MIN:
         return None, f"圆点峰不显著(高出基线{q:.0f}<{ZOOM_DOT_MIN:.0f})"
-    s = float(np.interp(y, ZOOM_TABLE_Y, ZOOM_TABLE_S))
+    s = _dot_y_to_s(y)
     edge = ""
-    if y < ZOOM_TABLE_Y[0] or y > ZOOM_TABLE_Y[-1]:
-        edge = f"（超出标定段[{ZOOM_TABLE_Y[0]},{ZOOM_TABLE_Y[-1]}]，取端点）"
+    if not (ZOOM_DOT_Y_CLAMP[0] <= y <= ZOOM_DOT_Y_CLAMP[1]):
+        edge = f"（超出标定段[{ZOOM_DOT_Y_CLAMP[0]:.0f},{ZOOM_DOT_Y_CLAMP[1]:.0f}]，取端点）"
     return s, f"滑条圆点y={y:.0f}→s={s:.2f}{edge}"
 
 
