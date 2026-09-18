@@ -390,9 +390,15 @@ def nav_column_ncc(roi_bgr, panel=FIXED_PANEL):
 
 
 def map_open_from_roi(roi_bgr, panel=FIXED_PANEL):
-    """地图画面是否打开（ROI 版，返回 (bool, 依据字符串)）。
+    """地图画面是否打开（ROI 版，返回 `(bool, 依据字符串, 主判据是否成立)`）。
 
     主判据 = 导航列 NCC ≥ NAV_NCC_MIN；导航列模板缺失时退回 雾 ≥ FOG_OPEN_MIN。
+
+    第三项 `nav_ok` = **主判据自己**说「开」，而不是雾兜底说开。雾兜底是「低精度、高召回」：
+    它能把开态救回来，代价是**关闭动画那几帧也会被判成开**（2026-09-18 实机 22:52:33：
+    导航列 NCC −0.01（列根本不在）而雾 0.41 ⇒ 判开）。跟踪链路必须区分这两者 —— 只有主判据
+    说开时，判丢才允许销毁 `_last_rgba`，否则 G 开回来无图可放回（bug① 换个入口复发，
+    实机 22:52:35 判丢 → 22:52:42「上次没有成功投影 ⇒ 不自动恢复」）。
     """
     ncc = nav_column_ncc(roi_bgr, panel)
     px, py, pw, ph = panel
@@ -400,12 +406,12 @@ def map_open_from_roi(roi_bgr, panel=FIXED_PANEL):
     region = roi_bgr[py - ry:py - ry + ph, px - rx:px - rx + pw]
     fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24).mean())
     if ncc is None:
-        return fog >= FOG_OPEN_MIN, f"导航列模板缺失→雾{fog:.2f}"
+        return fog >= FOG_OPEN_MIN, f"导航列模板缺失→雾{fog:.2f}", False
     if ncc >= NAV_NCC_MIN:
-        return True, f"导航列{ncc:.2f}"
+        return True, f"导航列{ncc:.2f}", True
     if fog >= FOG_OPEN_MIN:
-        return True, f"导航列{ncc:.2f}偏低→雾{fog:.2f}兜底"
-    return False, f"导航列{ncc:.2f} 雾{fog:.2f}"
+        return True, f"导航列{ncc:.2f}偏低→雾{fog:.2f}兜底", False
+    return False, f"导航列{ncc:.2f} 雾{fog:.2f}", False
 
 
 def map_is_open(shot_bgr, panel=FIXED_PANEL):
@@ -413,7 +419,8 @@ def map_is_open(shot_bgr, panel=FIXED_PANEL):
 
     热键路径在跑匹配前用它拒掉大厅/结算等非地图画面（CLAUDE.md 待办 3）。
     """
-    return map_open_from_roi(roi_of(shot_bgr, panel), panel)
+    is_open, why, _nav_ok = map_open_from_roi(roi_of(shot_bgr, panel), panel)
+    return is_open, why
 
 
 # ---- 缩放滑条读数（2026-09-17 用户提示：右侧 UI 的长条 + 圆点，点的位置=缩放程度）------
