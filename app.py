@@ -78,6 +78,7 @@ SCORE_CONFIDENT = float(_CFG["match"]["score_confident"])
 ALIGN_SCORE_MAX = float(_CFG["match"]["align_score_max"])
 OVERLAP_MIN = float(_CFG["match"]["overlap_min"])
 SAMPLE_MASK_MIN = float(_CFG["match"]["sample_mask_min"])
+SAMPLE_LEAD_MIN = float(_CFG["match"].get("lead_min", 0.25))
 DOMINANT_CLS_MAX = float(_CFG["match"].get("dominant_cls_max", 0.90))
 # 扩大取样梯子（单类占比>DOMINANT_CLS_MAX 时依次尝试；只在当前档仍退化才降档）
 SAMPLE_LADDER = (0.25, 0.32)
@@ -94,6 +95,21 @@ def _dominant_frac(cls, mask):
 def _degenerate(res):
     """多种子同分退化（sc<0.001 且与次名分差<0.001），与 _after_match 退化闸同款。"""
     return len(res) >= 2 and res[0][0] < 0.001 and (res[1][0] - res[0][0]) < 0.001
+
+
+def _lead_frac(res) -> float | None:
+    """入口 top1 相对 top2 的领先幅度 ∈[0,1]（分越小越好 ⇒ (top2−top1)/top2）。
+
+    只有一个结果 ⇒ 1.0（其余种子都弃权了，无次名可比；与 e34 口径一致）。无结果 ⇒ None。
+    用途：结构闸的逃生门（见 config `[match].lead_min` 与 experiments/e34_evidence_gate.py）——
+    「样本结构占比」只是"能不能判"的**代理**，而入口层判的是**墙**；用入口层自己的领先幅度更对症。
+    """
+    if not res:
+        return None
+    if len(res) < 2 or res[1][0] <= 1e-9:
+        return 1.0
+    return (res[1][0] - res[0][0]) / res[1][0]
+
 
 # 入口判别力降序：侧门/二楼房间形状各异（主要判别依据）；正门固定分不出种子。
 ENTRANCE_TYPES = ("侧门", "二楼", "正门")
@@ -408,12 +424,23 @@ class MainWindow(QWidget):
                                    icon_k=icon_k)
         # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
         # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
+        # **逃生门（2026-09-18）**：结构占比只是"能不能判"的**代理**，而入口层判的是**墙**
+        # （被拒样本里仍含 581~1348 个墙像素）。入口匹配已经跑完了(res) ⇒ 直接用**入口层
+        # 自己的领先幅度**判：top1 领先次名 ≥ `lead_min` 就放行。
+        # 依据 experiments/e34_evidence_gate.py（44 张主集）：领先≥0.25 时**出图且对 14→21
+        # （+7）、出图但错仍是 3 张没多**；领先≥0.15 就开始崩（错 3→10）。
         _cls, smask = sample_structure(sample)
         if smask.mean() < SAMPLE_MASK_MIN:
-            self._log_step(f"样本结构仅{smask.mean() * 100:.0f}%（入口周围未探明）→ "
-                           "请在刚进入口、周围已探明时再按", "WARN")
-            self._log(et, [], icon_pos, isc, None, corrected=False)
-            return
+            lead = _lead_frac(res)
+            if lead is None or lead < SAMPLE_LEAD_MIN:
+                why_lead = ("入口无结果" if lead is None
+                            else f"入口领先仅{lead:.0%}")
+                self._log_step(f"样本结构仅{smask.mean() * 100:.0f}%（入口周围未探明）且{why_lead}"
+                               f"（<{SAMPLE_LEAD_MIN:.0%}）→ 请在刚进入口、周围已探明时再按", "WARN")
+                self._log(et, res, icon_pos, isc, None, corrected=False)
+                return
+            self._log_step(f"样本结构仅{smask.mean() * 100:.0f}%，但入口 top1 领先次名 {lead:.0%}"
+                           f"（≥{SAMPLE_LEAD_MIN:.0%}）→ 放行", "INFO")
         self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
         dom = _dominant_frac(_cls, smask)
         # 扩大取样梯子：单类占比过高 = 入口周围是单一均匀区（大片走廊/雾），分类

@@ -38,6 +38,14 @@ SCORE_CONFIDENT = float(_CFG["match"]["score_confident"])
 ALIGN_SCORE_MAX = float(_CFG["match"]["align_score_max"])
 OVERLAP_MIN = float(_CFG["match"]["overlap_min"])
 SAMPLE_MASK_MIN = float(_CFG["match"]["sample_mask_min"])
+LEAD_MIN = float(_CFG["match"].get("lead_min", 0.25))
+
+
+def _lead(res):
+    """入口 top1 相对 top2 的领先幅度（app._lead_frac 同款）；只有一个结果 ⇒ 1.0。"""
+    if len(res) < 2 or res[1][0] <= 1e-9:
+        return 1.0
+    return (res[1][0] - res[0][0]) / res[1][0]
 DOMINANT_CLS_MAX = float(_CFG["match"].get("dominant_cls_max", 0.90))
 LABELS = ROOT / "eval" / "labels.csv"
 
@@ -106,9 +114,11 @@ def evaluate_sample(shot, lib, entrance_type, gt_seed):
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
                     degenerate=False, rejected=False)
-    # 快速失败闸镜像（app._entrance_pipeline_impl 同款先于匹配）：未探明样本 app 拒答。
+    # 快速失败闸镜像（app._entrance_pipeline_impl 同款）：未探明样本 app 默认拒答，
+    # **但 2026-09-18 起有逃生门** —— 入口 top1 领先次名 ≥ lead_min 时放行（结构占比只是
+    # "能不能判"的代理，入口层判的是墙；依据 experiments/e34_evidence_gate.py）。
     cls, mask = sample_structure(_crop_around_icon(shot, panel, ip, 0.18, icon_k=ik))
-    if mask.mean() < SAMPLE_MASK_MIN:
+    if mask.mean() < SAMPLE_MASK_MIN and _lead(res) < LEAD_MIN:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
                     degenerate=False, rejected=True)
