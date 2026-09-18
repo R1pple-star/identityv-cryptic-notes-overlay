@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import csv
 import sys
+import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PySide6.QtCore import Qt, QRect, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -38,8 +40,9 @@ from core.entrance import (
 )
 from core.map_library import MapLibrary
 from core.vision import (FOG_OPEN_MIN, NAV_NCC_MIN, detect_fog_panel, load_bgr,
-                         map_is_open, map_open_from_roi, map_roi, panel_for_screen)
-from ui.capture import capture_monitor, capture_region
+                         map_is_open, map_open_from_roi, map_roi, panel_for_screen,
+                         zoom_scale_from_roi)
+from ui.capture import capture_monitor, capture_region, monitor_size
 from ui.follow import (
     FOLLOW_IDLE_INTERVAL_MS, FOLLOW_INTERVAL_MS, FollowState,
 )
@@ -48,6 +51,8 @@ from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
 from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
+from ui.track import (TRACK_IDLE_INTERVAL_MS, TRACK_LOG_MIN_SEC, TRACK_LOST_MAX,
+                      TRACK_MOTION_MAD, TRACK_NEAR_R, TRACK_OK, Tracker, verdict)
 
 # DPI 缩放适配：让进程用物理像素（per-monitor DPI aware + Qt 禁用 high-DPI scaling），
 # 使 mss 截屏、Qt 窗口坐标、面板坐标(panel_for_screen) 三者统一于物理像素。否则 125%/150% 缩放下
@@ -208,6 +213,13 @@ class MainWindow(QWidget):
         self._follow_poll_paused = False  # 手动隐藏导致的轮询暂停（一次性日志防刷屏）
         self._follow_idle = 0             # 自动隐藏期间的降频计数（每 N 格才真截一次）
         self._last_rgba = None            # 上次成功投影的整屏 RGBA（G 重开地图时原样放回）
+        # 自动跟随·第二步（投影跟着地图平移/缩放，见 ui/track.py）：跟踪器 + 重对齐节流
+        self._track = Tracker()
+        self._track_arm = False           # 开态刚确立：跳一 tick 再开始跟踪（避开 G 开合动画过渡帧）
+        self._track_idle = 0              # 投影没动时的降频计数
+        self._track_log_t = 0.0           # 跟踪成功日志限流（拖动时别刷屏）
+        self._panel_prev = None           # 面板降采样上一帧（画面没动就整段跳过，省 ~70ms/次）
+        self._screen_wh = None            # 屏幕尺寸缓存（避免每 tick 新建/销毁 mss DC 句柄）
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowStaysOnTopHint
@@ -483,6 +495,7 @@ class MainWindow(QWidget):
             if info is not None:
                 rgba = map_to_overlay_rgba(str(info.path), align[0], *self._screen_size(), wall_alpha=self.settings.wall_alpha)
                 self._show_overlay(rgba)
+                self._seed_track(shot, seed, fl, info.path, align[0])
                 self._log_step("投影已显示", "OK")
             else:
                 self._refuse(f"种子{seed}({key}[{fl}])", f"引索里没有该种子的 {fl} 参考图")
@@ -553,6 +566,7 @@ class MainWindow(QWidget):
         if asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN:
             rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
             self._show_overlay(rgba)
+            self._seed_track(self._shot, self._seed, info.floor, info.path, M)
             self.status.setText(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
             self._log_step(f"手动重对齐: {info.key} 重合{asc:.2f} 重叠{ov:.2f} 已投影", "OK")
         else:
@@ -581,6 +595,9 @@ class MainWindow(QWidget):
             self.status.setText("3点标定失败（点不足）"); return
         rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
         self._show_overlay(rgba)
+        # 3 点标定走的是 affine_from_points —— **可能带旋转**，参数化与跟踪用的相似变换
+        # 不同（跟踪只认 s/tx/ty），喂进去会算错。故显式断根，该投影不参与跟随重对齐。
+        self._track.reset()
         self.status.setText(f"3点标定投影：{info.key}")
 
     def _manual_sample_pick(self):
@@ -621,13 +638,20 @@ class MainWindow(QWidget):
     # ---- 投影显示 ----
     def _screen_size(self):
         # 用 mss 主显示器物理尺寸（DPI aware 后=物理像素），与截屏/面板坐标一致；
-        # 不用 Qt primaryScreen.geometry()（DPI 缩放下可能返回逻辑像素致错位）
-        import mss
-        with mss.mss() as sct:
-            m = sct.monitors[1]
-            return int(m["width"]), int(m["height"])
+        # 不用 Qt primaryScreen.geometry()（DPI 缩放下可能返回逻辑像素致错位）。
+        # **缓存在 self._screen_wh**：跟随跟踪每 tick 都要烘焙投影，若每次现开 mss
+        # 就是 2026-09-14 那个「GDI DC 开合 4 次/秒毁英伟达截图」的坑（见 ui/capture）。
+        if self._screen_wh is None:
+            self._screen_wh = monitor_size(1)
+        return self._screen_wh
 
-    def _show_overlay(self, rgba):
+    def _paint_overlay(self, rgba):
+        """把整屏 RGBA 贴到投影窗（建窗 / 设透明度 / 显示）——**不含跟随状态机副作用**。
+
+        `_last_rgba` 在这里更新（而不是各调用方各自赋值）：它只有一个含义「当前屏幕上那张
+        投影」，任何一次贴图都该刷新它，否则「G 重开地图」放回的会是更旧的一张。
+        """
+        self._last_rgba = rgba
         if self.overlay is None:
             sw, sh = self._screen_size()
             self.overlay = MapOverlay(QRect(0, 0, sw, sh))
@@ -635,9 +659,30 @@ class MainWindow(QWidget):
                 self._log_step("投影未能排除截屏（跟随/重匹配可能受自污染）", "WARN")
         self.overlay.set_image(rgba)
         self.overlay.setWindowOpacity(self.opacity_slider.value() / 100.0)
-        self._last_rgba = rgba      # 供跟随「G 重开地图」时原样放回（见 _restore_overlay）
         self._set_overlay_visible(True)
+
+    def _show_overlay(self, rgba):
+        """新投影（热键 / 手动重对齐 / 3点标定）——会重置跟随状态机。"""
+        self._paint_overlay(rgba)
         self._follow.reset()  # 新投影=「我现在要投影」：清跟随挂起与确认态，重新 adopt
+
+    def _update_overlay(self, rgba):
+        """跟随跟踪刷新投影——与 `_show_overlay` 的唯一区别：**不碰跟随状态机**。
+
+        走 `_show_overlay` 会把 `_follow` 重置掉（那是"新投影"的语义），而跟踪是**同一个**
+        投影在挪位置，重置会让开合状态机每 tick 重新 adopt。
+        """
+        self._paint_overlay(rgba)
+
+    def _seed_track(self, shot, seed, floor, ref_path, M):
+        """把刚显示出来的投影登记给跟踪器（跟随要靠它做局部重对齐）。"""
+        panel = detect_fog_panel(shot)
+        if panel is None or M is None:
+            self._track.reset()
+            return
+        self._track.seed_from(panel, seed, floor, str(ref_path), M, 1.0 / float(M[0, 0]))
+        self._track_idle = 0
+
 
     def _restore_overlay(self) -> bool:
         """地图被 G 重新打开 ⇒ 直接用**上次渲染好的投影**恢复显示，不重跑匹配。
@@ -677,6 +722,7 @@ class MainWindow(QWidget):
         """
         self._set_overlay_visible(False)
         self._last_rgba = None  # 清掉：跟随「G 重开地图」不许把上一张被否掉的投影放回来
+        self._track.reset()     # 跟踪也要断根：没有可信投影可跟
         self._log_step(f"不投影：{why}｜入口判定 {label}（位置未验证，仅供参考）", "WARN")
 
     def _hide_overlay(self):
@@ -729,12 +775,15 @@ class MainWindow(QWidget):
         self._log_step(f"自动跟随已开启：面板 {tuple(panel)} @ {FOLLOW_INTERVAL_MS}ms（地图关后降频到 "
                        f"{FOLLOW_IDLE_INTERVAL_MS}ms 继续等 G 开回来，手动隐藏才停），"
                        f"开闸: 导航列≥{NAV_NCC_MIN} 或 雾≥{FOG_OPEN_MIN}", "OK")
+        self._log_step("跟随第二步：投影已按热键出来后会跟着地图平移/缩放（近处小窗→单尺度重对齐；"
+                       "连丢两次则隐藏投影，提示重按热键）")
 
     def _stop_follow(self):
         if self._follow_timer is not None and self._follow_timer.isActive():
             self._follow_timer.stop()
             self._log_step("自动跟随已关闭")
         self._follow.reset()
+        self._panel_prev = None
 
     def _follow_tick(self):
         if not self.settings.auto_follow or self._follow_panel is None:
@@ -780,9 +829,13 @@ class MainWindow(QWidget):
         is_open, why = map_open_from_roi(roi, self._follow_panel)
         evt = self._follow.feed(is_open)
         if evt is None:
+            # 稳定态：地图开着 + 投影显示 ⇒ 让它跟着地图平移/缩放（自动跟随·第二步）
+            if visible and self._follow.confirmed is True:
+                self._maybe_track(roi)
             return  # 静默：稳定态/防抖中不刷日志
         _kind, state = evt
         if self._follow.suspended:
+            self._track_arm = False
             self._log_step(f"跟随暂停中（地图{'开' if state else '关'}），不动投影")
             return
         restored = True
@@ -790,9 +843,115 @@ class MainWindow(QWidget):
             restored = self._restore_overlay()   # G 把地图开回来 ⇒ 放回上次的投影
         elif not state and self.overlay.isVisible():
             self._set_overlay_visible(False)
+        # 开合刚翻转 ⇒ 跳一 tick 再跟踪：G 开合有动画，过渡帧的面板不是稳态
+        self._track_arm = True
+        self._track_idle = 0
         if restored:
             self._log_step(f"跟随: 地图{'开' if state else '关'} → "
                            f"投影{'显示' if state else '隐藏'}（{why}）")
+
+    # ---- 自动跟随·第二步：投影跟着地图平移/缩放（设计见 ui/track.py 模块头）----
+    def _maybe_track(self, roi):
+        """跟踪节流：画面没动就整段跳过；静止时降频，动了回全速。"""
+        if self._track_arm:
+            self._track_arm = False     # 开态刚确立，本 tick 只做准备
+            return
+        if not self._track.active:
+            return
+        if self._track_idle:
+            self._track_idle += 1
+            step = max(1, TRACK_IDLE_INTERVAL_MS // FOLLOW_INTERVAL_MS)
+            if self._track_idle % step:
+                return
+        self._track_tick(roi)
+
+    def _track_tick(self, roi):
+        """一次重对齐尝试：近处小窗 → 单尺度全平移。**不做全域尺度搜索**（1.5s，会冻 UI）。"""
+        tr = self._track
+        px, py, pw, ph = self._follow_panel
+        rx, ry, _x1, _y1 = map_roi(self._follow_panel)
+        region = roi[py - ry:py - ry + ph, px - rx:px - rx + pw]   # 零拷贝视图
+        if region.size == 0 or region.shape[0] < ph * 0.5 or region.shape[1] < pw * 0.5:
+            return
+        # 画面没动 ⇒ 地图没动 ⇒ 投影原样有效，一次匹配都不用跑（投影窗已排除截屏，
+        # 面板像素只可能来自游戏本身；玩家的黄点只占几个像素，降采样后淹没在噪声里）。
+        small = cv2.resize(region, (64, 34), interpolation=cv2.INTER_AREA).astype(np.int16)
+        prev, self._panel_prev = self._panel_prev, small
+        if prev is not None and float(np.abs(small - prev).mean()) < TRACK_MOTION_MAD:
+            tr.note_ok()
+            return
+        try:
+            ref = load_bgr(tr.ref_path)
+        except Exception as e:  # noqa: BLE001
+            self._log_step(f"跟踪：参考图读不出（{e}）→ 停止跟踪", "WARN")
+            tr.reset(); return
+
+        # 尺度：滑条实测值优先。对齐分选不出尺度（vision.ZOOM_TABLE_* 长注 + CLAUDE.md ⑥）
+        s_ui, why_s = zoom_scale_from_roi(roi, self._follow_panel)
+        scale_moved = s_ui is not None and abs(s_ui - tr.s) > TRACK_DEADBAND_S
+
+        # 1) 尺度没变：先试上次位置附近的小窗（半径 < 半个迷宫格周期 ⇒ 窗内不可能有幽灵相位）
+        sc_near = None
+        if not scale_moved:
+            near = find_overlay_transform(None, ref, self._follow_panel, region=region,
+                                          hint_s=tr.s, hint_icon=tr.pin(), fast=True,
+                                          hint_radius=TRACK_NEAR_R, ref_key=tr.ref_path)
+            sc_near = near[1] if near is not None else None
+            if near is not None and sc_near < TRACK_OK and near[2] >= TRACK_OVERLAP_MIN:
+                self._track_adopt(near[0], tr.s, "平移")
+                return
+        # 尺度变了就不走小窗：在**错尺度**上小窗也能找到低分位置（实测假接受，图标偏 78~180px）
+
+        # 2) 上一帧位置对不上了 ⇒ 换尺度做单尺度全平移。候选**按优先级**逐个试、谁先过闸用谁；
+        #    **绝不"挑分最小的那个尺度"** —— 分对 s 单调偏低（技术备忘⑥），滑条值 0.35 与旧值
+        #    0.31 同场竞逐时挑分必选 0.31，于是又滑回旧尺度、投影偏 26px。
+        cands = [s_ui] if s_ui is not None else []
+        if s_ui is None or abs(s_ui - tr.s) > 0.02:
+            cands.append(tr.s)
+        for s in cands:
+            r = find_overlay_transform(None, ref, self._follow_panel, region=region,
+                                       hint_s=s, fast=True, ref_key=tr.ref_path)
+            if r is None:
+                continue
+            v = verdict(sc_near, r[1], r[2])
+            if v == "accept":
+                self._track_adopt(r[0], float(s), f"重对齐 尺度{s:.2f}"
+                                                    f"{'（滑条）' if s == s_ui else '（沿用上次）'}")
+                return
+            if v == "keep":
+                tr.note_ok(); return
+        self._track_lost(f"证据不足（候选尺度 {[round(c, 3) for c in cands]} 都不过闸）")
+
+    def _track_adopt(self, M, s, why):
+        """接受新变换：过死区才重烘焙投影（省掉一次 warpAffine 1920×1080 + QPixmap）。"""
+        tr = self._track
+        moved = tr.advanced(M, s)
+        tr.adopt(M, s)
+        self._track_idle = 0            # 动过 ⇒ 恢复全速
+        if not moved:
+            return
+        try:
+            rgba = map_to_overlay_rgba(tr.ref_path, M, *self._screen_size(),
+                                       wall_alpha=self.settings.wall_alpha)
+        except Exception as e:  # noqa: BLE001
+            self._log_step(f"跟踪：重烘焙投影失败（{e}）", "WARN"); return
+        self._update_overlay(rgba)      # 不碰跟随状态机（同一个投影在挪位置）
+        now = time.monotonic()
+        if now - self._track_log_t >= TRACK_LOG_MIN_SEC:
+            self._track_log_t = now
+            self._log_step(f"跟随: 投影跟着地图更新（{why}）")
+
+    def _track_lost(self, why):
+        """判丢：连忍 TRACK_LOST_MAX 次才动投影 —— 判丢后**隐藏**而不是留着错位置。"""
+        tr = self._track
+        n = tr.note_lost()
+        self._track_idle = 0
+        if n < TRACK_LOST_MAX:
+            return
+        self._set_overlay_visible(False)
+        self._last_rgba = None      # 不留旧的：G 重开地图时也不许把错位置放回来
+        tr.reset()
+        self._log_step(f"跟丢（{why}）→ 已隐藏投影，请按热键重新匹配", "WARN")
 
     # ---- 失败回收（§6.3）：log.csv + inbox ----
     def _log(self, entrance_type, res, icon_pos, isc, align, corrected: bool):

@@ -8,11 +8,19 @@
 """
 from __future__ import annotations
 
+import ctypes
+
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+
+# 从截屏画面排除（同 ui/overlay 的投影窗）。**预览窗必须也排除**：它是可拖动的普通窗口，
+# 一旦被拖到地图面板上，窗口里那张样本图就会被截进面板 —— 污染探明模板、雾占比、导航列
+# NCC，连"地图开没开"的判据都会一起坏（不是只影响匹配）。设后不得再 setWindowFlags
+# （重建 HWND 丢 affinity）。
+WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
 class SamplePreview(QWidget):
@@ -32,6 +40,11 @@ class SamplePreview(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._label)
         self.resize(282, 282)
+        try:  # 截屏排除：失败（旧系统/offscreen）不抛，只是少一层保护
+            self.capture_excluded = bool(ctypes.windll.user32.SetWindowDisplayAffinity(
+                int(self.winId()), WDA_EXCLUDEFROMCAPTURE))
+        except Exception:  # noqa: BLE001
+            self.capture_excluded = False
         # 关闭按钮：看过即可关（hide 不销毁，下次匹配 set_sample+show 复用）
         self._btn_close = QPushButton("✕", self)
         self._btn_close.setFixedSize(22, 22)

@@ -41,6 +41,32 @@ PAD = 12
 # 次级幽灵(墙重合 60%→4%)。图标锚定+钉平移: score 0.046/ov 1.00/s 0.986/墙重合 60%。
 ANCHOR_RADIUS = 0
 
+# 参考侧预处理缓存（2026-09-17 跟随跟踪专用）。content_bbox + classify_region +
+# walls_as_floors + to_match3 要 68ms，而它们**只是 (参考图) 的纯函数** —— 跟随每 tick 都要
+# 调一次对齐，不缓存则主线程光这一项就 68ms/次。键由调用方给（传参考图路径）；容量 3。
+# 只在 ref_key 给定时启用，不给则每次现算（热键路径不传 ⇒ 行为与以前逐位一致）。
+_REF_PACK_CACHE: dict = {}
+REF_CACHE_MAX = 3
+
+
+def _ref_pack(ref_bgr, ref_key=None) -> dict:
+    """参考侧预处理：内容裁剪 + 补边 + 分类 + one-hot。`ref_key` 给定则缓存。"""
+    if ref_key is not None and ref_key in _REF_PACK_CACHE:
+        return _REF_PACK_CACHE[ref_key]
+    cx0, cy0, cw, ch = content_bbox(ref_bgr)
+    ref_c = cv2.copyMakeBorder(ref_bgr[cy0:cy0 + ch, cx0:cx0 + cw],
+                               PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    ref_cls = walls_as_floors(classify_region(ref_c), ref_c)
+    pack = {"ox": cx0 - PAD, "oy": cy0 - PAD,      # ref 补边系 → ref 原图系 的平移
+            "shape": ref_cls.shape, "oh": to_match3(ref_cls),
+            "content": cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY) > 40}
+    if ref_key is not None:
+        if len(_REF_PACK_CACHE) >= REF_CACHE_MAX:
+            _REF_PACK_CACHE.clear()
+        _REF_PACK_CACHE[ref_key] = pack
+    return pack
+
+
 
 def _revealed_mask(region, cls_r):
     """已探明真结构掩膜：分类为 墙/房/通路 且 **非迷雾**。
@@ -122,7 +148,8 @@ def _subpixel_min(res, mx, my):
 
 
 def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SCALES,
-                           region=None, hint_s=None, hint_icon=None, fast=False):
+                           region=None, hint_s=None, hint_icon=None, fast=False,
+                           hint_radius=None, ref_key=None):
     """求参考图→屏幕的最佳对齐变换 M(2x3)，使参考图与游戏内已探明结构重合。
 
     用迷雾剔除后的探明模板，对参考图(内容裁剪)做掩膜匹配，取最佳
@@ -139,12 +166,23 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
             图标锚定后 67%)。图标是唯一无歧义锚点。
     fast:   只在 hint_s 单尺度匹配(平移跟踪用，~30ms；须与 hint_s 同给)。
             玩家平移地图不改尺度，单档即可拿到精确平移；缩放变了分会上来，由调用方降级。
+    hint_radius: 覆盖 ANCHOR_RADIUS 的窗搜半径（**只给跟随跟踪用**）。跟踪的锚点是"上一帧
+            位置"这个**预测**而不是硬约束，需要容许它挪一点；取 ≤ 半个迷宫格周期(25px) 的
+            半径可保证窗内不含幽灵相位，小的平移漂移就能被稳稳纠回。
+            不给(None) ⇒ 用 ANCHOR_RADIUS(0)，热键/入口路径行为逐位不变。
+    ref_key: 参考图缓存键（通常传参考图路径）。给了就复用参考侧预处理（省 68ms/次），
+            不给则每次现算。**只影响速度，不影响结果**。
 
     尺度搜索三段式(粗 0.05→细 0.01→微 0.002)+亚像素位置(二次曲线拟合)：
     旧版只搜 0.05 粗档，真实尺度常落在档间(如 17.13 真尺度 0.986 落在 0.95/1.00 间)，
     粗档最优 0.95(score 0.106)实为擦肩，远端可偏 20+ 像元。细化后 0.986(score 0.045)，
     远端对齐显著改善。微搜(0.002)用来逼近真极小(亚像素尺度二次曲线在 0.01 档上不对称、
     不可靠，故用细网格而非抛物插值)。
+
+    ⚠️ **尺度别指望"挑分最小"**（2026-09-17 实测，见 CLAUDE.md 技术备忘⑥）：错配率对 s
+    单调递增（模板越小覆盖越少、离群像素被一起缩掉），真尺度处**不是**极小 ⇒ 全域 argmin
+    典型偏低 0.01~0.02、曲线平坦时偏低 0.09。调用方应用可信的尺度来源（导航列缩放滑条
+    `vision.zoom_scale_from_roi`，或图标锚点扫描）把 `scales` 收窄，而不是放任全域搜索。
 
     坐标推导：模板(面板坐标 bx0,by0,宽bw 高bh) 缩放 s 后在 ref 内容里匹配到
     (ml_x,ml_y)，故 ref内容坐标(rx,ry) ↔ 面板(bx0+(rx-ml_x)/s, by0+(ry-ml_y)/s)，
@@ -168,31 +206,26 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     temp_cls = cls_r[by0:by1 + 1, bx0:bx1 + 1]
     temp_mask = revealed[by0:by1 + 1, bx0:bx1 + 1]
 
-    cx0, cy0, cw, ch = content_bbox(ref_bgr)
-    # 内容四周补黑边再匹配：玩家缩放到「整图刚好适配」时，模板尺寸≈内容尺寸，
-    # int 取整可能让 tw>rw → 尺度被整体跳过、细搜可行域只剩单侧(真尺度刀锋)。
-    # 补边放宽可行域；黑边 cls=0，掩膜像素不受影响。坐标推导按 (cx0-PAD+ml_x) 补偿。
-    ref_c = cv2.copyMakeBorder(ref_bgr[cy0:cy0 + ch, cx0:cx0 + cw],
-                               PAD, PAD, PAD, PAD, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-    ref_cls = walls_as_floors(classify_region(ref_c), ref_c)
-    ref_shape = ref_cls.shape
+    pack = _ref_pack(ref_bgr, ref_key)
+    ox, oy = pack["ox"], pack["oy"]          # = cx0-PAD, cy0-PAD
+    ref_shape, ref_oh = pack["shape"], pack["oh"]
     # 参考侧预生成 3 通道 one-hot：代价图 = 掩膜和 − 加权一致数 ⇒ score = 错配率
     # （core/vision.py 长注）。这是**唯一**口径，旧的「类号平方差」已删。
-    ref_oh = to_match3(ref_cls)
+    rad = ANCHOR_RADIUS if hint_radius is None else int(hint_radius)
 
     def _anchored_center(s):
-        """该尺度下图标锚定的模板左上角(ref 补边坐标系)。ref 补边坐标 = 原图-(cx0-PAD)，
+        """该尺度下图标锚定的模板左上角(ref 补边坐标系)。ref 补边坐标 = 原图-ox，
         图标坐标(cx,cy)是原图系 ⇒ 先折算。ref=(panel-t)·s 且图标钉死 ⇒
-        模板TL(bx0,by0)panel → (icx-(cx0-PAD))+(bx0-icon_panel)·s。"""
+        模板TL(bx0,by0)panel → (icx-ox)+(bx0-icon_panel)·s。"""
         icx, icy, isx, isy = hint_icon
-        return (icx - (cx0 - PAD) + (bx0 - (isx - px)) * s,
-                icy - (cy0 - PAD) + (by0 - (isy - py)) * s)
+        return (icx - ox + (bx0 - (isx - px)) * s,
+                icy - oy + (by0 - (isy - py)) * s)
 
     def _search(scale_list):
         """在给定尺度列表上做掩膜匹配，返回最佳 (score,s,ml_x,ml_y,res,msum,off) 或 None。"""
         best = None
         for s in scale_list:
-            kw = ({"center": _anchored_center(float(s)), "radius": ANCHOR_RADIUS}
+            kw = ({"center": _anchored_center(float(s)), "radius": rad}
                   if hint_icon is not None else {})
             r = _match_at_scale(ref_oh, temp_cls, temp_mask, bw, bh, s, ref_shape, **kw)
             if r is None:
@@ -207,7 +240,7 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
         # 快速档：只在 hint_s 单尺度匹配(平移跟踪)。缩放变了分会上来，由调用方降级重搜。
         if hint_s is None:
             return None
-        kw = ({"center": _anchored_center(float(hint_s)), "radius": ANCHOR_RADIUS}
+        kw = ({"center": _anchored_center(float(hint_s)), "radius": rad}
               if hint_icon is not None else {})
         r = _match_at_scale(ref_oh, temp_cls, temp_mask, bw, bh, float(hint_s), ref_shape,
                             **kw)
@@ -244,15 +277,14 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     ml_x, ml_y = spx + _off[0], spy + _off[1]
 
     inv_s = 1.0 / s
-    # ml 在补边坐标系里，内容原点 = (cx0-PAD, cy0-PAD)
-    tx = px + bx0 - (cx0 - PAD + ml_x) * inv_s
-    ty = py + by0 - (cy0 - PAD + ml_y) * inv_s
+    # ml 在补边坐标系里，内容原点 = (ox, oy) = (cx0-PAD, cy0-PAD)
+    tx = px + bx0 - (ox + ml_x) * inv_s
+    ty = py + by0 - (oy + ml_y) * inv_s
     # 可靠性闸：已探明像素经逆变换(X=(screen-tx)*s)后，查参考图「内容掩膜(非背景)」
     # 看是否落在真实内容上。只查内容外接框太松(框很大，几乎都落框内，不判别)。
     # 小模板侥幸低分但变换错位时(如 7% 的 23.43)，探明会落到参考图背景上 → overlap 低。
     # 注：细搜会压低小模板分数，故 overlap 闸是必备二次验证(挡侥幸低分错配)。
-    ref_gray = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY)
-    ref_content = ref_gray > 40
+    ref_content = pack["content"]
     rev_ys, rev_xs = np.where(revealed > 0)
     ref_xc = (px + rev_xs - tx) * s
     ref_yc = (py + rev_ys - ty) * s

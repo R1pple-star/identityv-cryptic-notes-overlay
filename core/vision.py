@@ -412,3 +412,75 @@ def map_is_open(shot_bgr, panel=FIXED_PANEL):
     """
     return map_open_from_roi(roi_of(shot_bgr, panel), panel)
 
+
+# ---- 缩放滑条读数（2026-09-17 用户提示：右侧 UI 的长条 + 圆点，点的位置=缩放程度）------
+# 动机：**对齐分选不出尺度**（技术备忘⑥）—— 分对 s 单调递增、真尺度处不是极小，于是「挑分
+# 最小的尺度」典型偏低 0.01~0.02、曲线平坦时偏低 0.09（几千像素错位），且恒被 ALIGN_SCALES
+# 下界 0.30 截住；而游戏最放大时真尺度是 0.25。滑条直接给出当前缩放，绕开这一整条病根。
+#
+# 几何：滑条在导航列里，轨道是那条亮细竖条（模板内 x=NAV_TRACK_X），圆点=轨道上又亮又宽的
+# 峰。实测模板（7 张全屏实机图的均值）轨道列 x=84，圆点只在 y∈[380,730] 内活动。
+#
+# 标定（experiments/e37_video_zoom.py）：拿用户录的 15.9s 缩放演示视频逐帧读圆点，再对每帧
+# 做**逐尺度图标锚点扫描**求真值（引索 json 的图标 cx/cy ↔ `_find_icon` 的屏幕坐标；真对齐
+# 必须把前者映到后者）。11 个点、图标误差 1~22px、单调：
+#     圆点y  382  421  440 | 464  483  522 | 550 | 589 | 646 | 651 | 708
+#     s     0.25 0.25 0.25| 0.30 0.30 0.30|0.35 |0.40 |0.45 |0.50 |0.60
+# **全种子通用**（种子 2/6/10/13 在同一圆点处得到同一 s）：圆点是游戏 UI，参考素材又是同一
+# 渲染器、同一归一化尺度。圆点越靠下 s 越大（`+` 钮在顶 ⇒ 往上 = 放大）。
+# ⚠️ 只在**全屏**布局可用：窗口化时导航列整体位移（nav_column_ncc 掉到 0.34），读数无意义。
+# 故要求导航列 NCC 过闸才认，且调用方必须有回退路径。
+NAV_TRACK_X = 84                 # 滑条轨道列（模板内坐标）
+NAV_DOT_RANGE = (380, 730)       # 圆点可活动的 y 段（模板内坐标）
+ZOOM_DOT_MIN = 15.0              # 圆点峰须高出轨道基线这么多才算读到了（否则判读数失败）
+# 圆点 y → 尺度 s 的标定表（模板内坐标，y 必须单调递增）
+ZOOM_TABLE_Y = (382, 421, 440, 464, 483, 522, 550, 589, 646, 651, 708)
+ZOOM_TABLE_S = (0.25, 0.25, 0.25, 0.30, 0.30, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60)
+
+
+def nav_dot_y(roi_bgr, panel=FIXED_PANEL):
+    """导航列滑条圆点的 y（**模板内坐标**，已按面板宽折算）+ 峰高出基线的量。
+
+    读不到（ROI 太小/全黑）返回 (None, 0.0)。质量分给调用方自己判（< ZOOM_DOT_MIN 别用）。
+    """
+    nx0, ny0, nx1, ny1 = nav_band(panel)
+    rx, ry, _x1, _y1 = map_roi(panel)
+    band = roi_bgr[ny0 - ry:ny1 - ry, nx0 - rx:nx1 - rx]
+    if band.size == 0:
+        return None, 0.0
+    k = band.shape[1] / float(NAV_BAND[2])          # 多分辨率：按宽度折算回模板坐标
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    tx = int(round(NAV_TRACK_X * k))
+    if tx < 3 or tx + 4 > gray.shape[1]:
+        return None, 0.0
+    seg = gray[:, tx - 3:tx + 4].mean(axis=1)
+    r0 = max(0, int(round(NAV_DOT_RANGE[0] * k)))
+    r1 = min(len(seg) - 1, int(round(NAV_DOT_RANGE[1] * k)))
+    if r1 - r0 < 20:
+        return None, 0.0
+    base = float(np.median(seg[r0:r1]))
+    i = int(np.argmax(seg[r0:r1])) + r0
+    return i / k, float(seg[i]) - base
+
+
+def zoom_scale_from_roi(roi_bgr, panel=FIXED_PANEL):
+    """读当前地图缩放尺度 s（`s = 参考图px / 面板px`）。返回 (s, 依据字符串)。
+
+    失败返回 (None, 原因)：导航列不在标定位置（窗口化布局）、圆点峰不显著、ROI 太小。
+    **调用方必须能回退**（回退到尺度搜索，见 CLAUDE.md 技术备忘⑥）。
+    """
+    ncc = nav_column_ncc(roi_bgr, panel)
+    if ncc is None or ncc < NAV_NCC_MIN:
+        return None, f"导航列NCC{ncc if ncc is None else round(ncc, 2)}(<{NAV_NCC_MIN})，滑条读数不可用"
+    y, q = nav_dot_y(roi_bgr, panel)
+    if y is None:
+        return None, "导航列 ROI 太小"
+    if q < ZOOM_DOT_MIN:
+        return None, f"圆点峰不显著(高出基线{q:.0f}<{ZOOM_DOT_MIN:.0f})"
+    s = float(np.interp(y, ZOOM_TABLE_Y, ZOOM_TABLE_S))
+    edge = ""
+    if y < ZOOM_TABLE_Y[0] or y > ZOOM_TABLE_Y[-1]:
+        edge = f"（超出标定段[{ZOOM_TABLE_Y[0]},{ZOOM_TABLE_Y[-1]}]，取端点）"
+    return s, f"滑条圆点y={y:.0f}→s={s:.2f}{edge}"
+
+

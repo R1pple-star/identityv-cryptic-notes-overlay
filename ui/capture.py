@@ -71,6 +71,16 @@ def capture_region(left: int, top: int, width: int, height: int) -> np.ndarray:
     return bgra[:, :, :3]
 
 
+def monitor_size(index: int = 1) -> tuple[int, int]:
+    """显示器物理尺寸 (宽, 高)。index 从 1 开始（1=主显示器）。
+
+    复用常驻单例 —— **不要**在跟随循环里 `with mss.mss()` 现开现关：那是 2026-09-14
+    毁英伟达截图的同一个坑（4 次/秒的 GDI DC 开合），单例之后才不成立。
+    """
+    m = _sct().monitors[index]
+    return int(m["width"]), int(m["height"])
+
+
 def capture_monitor(index: int = 1) -> np.ndarray:
     """截取整个显示器，返回 BGR ndarray。index 从 1 开始（1=主显示器）。"""
     mon = _sct().monitors[index]
