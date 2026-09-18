@@ -67,6 +67,7 @@ TRACK_RULER_K_STEP = 0.05     # `_find_icon` 的尺度网格步长（见 vision.
 TRACK_SCALE_BAND = 0.05   # 滑条给出的尺度只信到这个半宽；超出就在滑条值周围带内重扫
 TRACK_IDLE_INTERVAL_MS = 1000   # 投影没动时的探针周期（动了立刻回到全速）
 TRACK_LOG_MIN_SEC = 1.5   # 跟踪成功日志的最小间隔（拖动时别刷屏）
+TRACK_BEAT_MIN_SEC = 1.5  # 跟踪**心跳**日志的最小间隔（每 tick 走哪条路；2026-09-18 立）
 # 合法尺度域（防滑条读数离谱时把搜索带出域）
 SCALE_LO, SCALE_HI = float(ALIGN_SCALES[0]), float(ALIGN_SCALES[-1])
 

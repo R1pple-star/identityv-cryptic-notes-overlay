@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import sys
 import time
 import tomllib
@@ -51,9 +52,9 @@ from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
 from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
-from ui.track import (TRACK_ICON_SCORE_MIN, TRACK_IDLE_INTERVAL_MS, TRACK_LOG_MIN_SEC,
-                      TRACK_LOST_MAX, TRACK_MOTION_MAD, TRACK_NEAR_R, TRACK_OK, Tracker,
-                      ruler_slop, verdict)
+from ui.track import (TRACK_BEAT_MIN_SEC, TRACK_ICON_SCORE_MIN, TRACK_IDLE_INTERVAL_MS,
+                      TRACK_LOG_MIN_SEC, TRACK_LOST_MAX, TRACK_MOTION_MAD, TRACK_NEAR_R,
+                      TRACK_OK, Tracker, ruler_slop, verdict)
 
 # DPI 缩放适配：让进程用物理像素（per-monitor DPI aware + Qt 禁用 high-DPI scaling），
 # 使 mss 截屏、Qt 窗口坐标、面板坐标(panel_for_screen) 三者统一于物理像素。否则 125%/150% 缩放下
@@ -235,6 +236,7 @@ class MainWindow(QWidget):
         self._track_arm = False           # 开态刚确立：跳一 tick 再开始跟踪（避开 G 开合动画过渡帧）
         self._track_idle = 0              # 投影没动时的降频计数
         self._track_log_t = 0.0           # 跟踪成功日志限流（拖动时别刷屏）
+        self._track_beat_t = 0.0          # 跟踪**心跳**日志限流（每 tick 走哪条路，见 _track_beat）
         self._panel_prev = None           # 面板降采样上一帧（画面没动就整段跳过，省 ~70ms/次）
         self._screen_wh = None            # 屏幕尺寸缓存（避免每 tick 新建/销毁 mss DC 句柄）
 
@@ -367,7 +369,10 @@ class MainWindow(QWidget):
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         color = {"ERROR": "#ff6666", "WARN": "#ffcc66", "OK": "#66ff66"}.get(level, "#cccccc")
-        self.log_view.appendHtml(f'<span style="color:{color}">[{ts}] {msg}</span>')
+        # msg 必须转义：appendHtml 把整串当 HTML 解析，消息里的 `<`（「导航列NCC-0.03(<0.45)」
+        # 「入口领先仅15%(<0.25)」）会被当成标签开头，**把后面整段吃掉**（2026-09-18 bug②：
+        # 日志里所有截断点都恰好紧跟一个 `<`）——正是诊断最需要看的那几条。
+        self.log_view.appendHtml(f'<span style="color:{color}">[{ts}] {html.escape(msg)}</span>')
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
         self.status.setText(msg if len(msg) <= 56 else msg[:53] + "…")
@@ -859,7 +864,12 @@ class MainWindow(QWidget):
         if evt is None:
             # 稳定态：地图开着 + 投影显示 ⇒ 让它跟着地图平移/缩放（自动跟随·第二步）
             if visible and self._follow.confirmed is True:
-                self._maybe_track(roi)
+                self._maybe_track(roi, is_open)
+            elif visible:
+                # 心跳（§4 第 3 条静默路径）：投影显示着却没进跟踪链 —— `confirmed` 每次热键
+                # 出图都被 `_show_overlay` 的 `reset()` 清成 None，要连续 2 帧同判才重立。
+                self._track_beat(f"投影显示但不开跟踪（confirmed={self._follow.confirmed} "
+                                 f"track_active={self._track.active}）")
             return  # 静默：稳定态/防抖中不刷日志
         _kind, state = evt
         if self._follow.suspended:
@@ -879,33 +889,63 @@ class MainWindow(QWidget):
                            f"投影{'显示' if state else '隐藏'}（{why}）")
 
     # ---- 自动跟随·第二步：投影跟着地图平移/缩放（设计见 ui/track.py 模块头）----
-    def _maybe_track(self, roi):
-        """跟踪节流：画面没动就整段跳过；静止时降频，动了回全速。"""
+    def _maybe_track(self, roi, is_open):
+        """跟踪节流：画面没动就整段跳过；静止时降频，动了回全速。
+
+        `is_open` = 本 tick 的**原始**开合读数（未过防抖）。它可能比 `_follow.confirmed`
+        更早看到「G 关了地图」——跟踪要的正是这个更早的信号，见 `_track_tick`。
+        """
         if self._track_arm:
             self._track_arm = False     # 开态刚确立，本 tick 只做准备
+            self._track_beat("开态刚确立 → 本 tick 只做准备（不跟踪）")
             return
         if not self._track.active:
+            self._track_beat("跟踪器未登记（没有可信投影）→ 不跟踪")
             return
         if self._track_idle:
             self._track_idle += 1
             step = max(1, TRACK_IDLE_INTERVAL_MS // FOLLOW_INTERVAL_MS)
             if self._track_idle % step:
                 return
-        self._track_tick(roi)
+        self._track_tick(roi, is_open)
 
-    def _track_tick(self, roi):
+    def _track_beat(self, msg: str):
+        """跟踪**心跳**：把「这一 tick 走了哪条路」写进日志（限流 `TRACK_BEAT_MIN_SEC`）。
+
+        2026-09-18 立：实机日志 126 秒 / ~500 个 tick 里 `投影跟着地图更新` **0 条**，而三条
+        静默路径（帧差闸跳过 / 采纳但落在死区内 / `_maybe_track` 根本没被调到）在日志上完全
+        同形，只能靠猜。心跳把三者分开：帧差闸那条会留下「画面没动」，采纳那条会留下
+        「小窗/全平移 + 分/ov」，一条都不出说明是第三条（接线问题）。
+        """
+        now = time.monotonic()
+        if now - self._track_beat_t < TRACK_BEAT_MIN_SEC:
+            return
+        self._track_beat_t = now
+        self._log_step("跟随心跳: " + msg)
+
+    def _track_tick(self, roi, is_open):
         """一次重对齐尝试：近处小窗 → 单尺度全平移。**不做全域尺度搜索**（1.5s，会冻 UI）。"""
         tr = self._track
+        if not is_open:
+            # 本帧判「地图关」（G 关闭动画的过渡帧；状态机要连续 2 帧才确认，这半秒里
+            # confirmed 仍是 True ⇒ 本函数会被调到）。此时**不跟踪、更不判丢**：
+            # 过渡帧导航列 NCC 掉到 -0.03 ⇒ 滑条/图标尺子全失效 ⇒ 若照常判丢，连丢 2 次就
+            # 会把投影隐藏 + 清 `_last_rgba`，于是 G 开回来时无图可放回（2026-09-18 bug①：
+            # 19:41:32 跟丢 → 19:41:33 投影隐藏 → 19:41:58「上次没有成功投影」）。
+            return
         px, py, pw, ph = self._follow_panel
         rx, ry, _x1, _y1 = map_roi(self._follow_panel)
         region = roi[py - ry:py - ry + ph, px - rx:px - rx + pw]   # 零拷贝视图
         if region.size == 0 or region.shape[0] < ph * 0.5 or region.shape[1] < pw * 0.5:
+            self._track_beat(f"面板不在 ROI 内（{region.shape}）→ 跳过")
             return
         # 画面没动 ⇒ 地图没动 ⇒ 投影原样有效，一次匹配都不用跑（投影窗已排除截屏，
         # 面板像素只可能来自游戏本身；玩家的黄点只占几个像素，降采样后淹没在噪声里）。
         small = cv2.resize(region, (64, 34), interpolation=cv2.INTER_AREA).astype(np.int16)
         prev, self._panel_prev = self._panel_prev, small
-        if prev is not None and float(np.abs(small - prev).mean()) < TRACK_MOTION_MAD:
+        mad = float(np.abs(small - prev).mean()) if prev is not None else None
+        if mad is not None and mad < TRACK_MOTION_MAD:
+            self._track_beat(f"帧差{mad:.2f}<闸{TRACK_MOTION_MAD} 画面没动 → 跳过（不重对齐）")
             tr.note_ok()
             return
         try:
@@ -938,6 +978,8 @@ class MainWindow(QWidget):
                                           hint_radius=TRACK_NEAR_R, ref_key=tr.ref_path)
             sc_near = near[1] if near is not None else None
             if near is not None and sc_near < TRACK_OK and near[2] >= TRACK_OVERLAP_MIN:
+                self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} s={tr.s:.3f} "
+                                 f"→ 小窗(±{TRACK_NEAR_R}px) 分{sc_near:.3f} ov{near[2]:.2f} 采纳")
                 self._track_adopt(near[0], tr.s, "平移")
                 return
         # 尺度变了就不走小窗：在**错尺度**上小窗也能找到低分位置（实测假接受，图标偏 78~180px）
@@ -948,7 +990,8 @@ class MainWindow(QWidget):
         #      小窗（±12px）是有界的、且要过 TRACK_OK 才采纳，所以上面试完就可以收手了；
         #      连丢 TRACK_LOST_MAX 次会隐藏投影 —— 与「宁可什么都不给」一致（待办 1）。
         if s_ui is None:
-            self._track_lost(f"没有可信的尺度（{why_s}）")
+            self._track_beat(f"帧差{mad:.2f} 尺度源无（{why_s}）→ 判丢")
+            self._track_lost(f"没有可信的尺度（{why_s}）", is_open)
             return
 
         # 2) 上一帧位置对不上了 ⇒ 换尺度做单尺度全平移。候选**按优先级**逐个试、谁先过闸用谁；
@@ -964,12 +1007,21 @@ class MainWindow(QWidget):
                 continue
             v = verdict(sc_near, r[1], r[2])
             if v == "accept":
+                self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} s={s:.3f} "
+                                 f"→ 全平移 分{r[1]:.3f} ov{r[2]:.2f}（旧分"
+                                 f"{'None' if sc_near is None else f'{sc_near:.3f}'}）采纳")
                 self._track_adopt(r[0], float(s), f"重对齐 尺度{s:.2f}"
                                   f"（{s_src if s == s_ui else '沿用上次'}）")
                 return
             if v == "keep":
+                self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} s={s:.3f} "
+                                 f"→ 全平移 分{r[1]:.3f} ov{r[2]:.2f} 不如旧位置 ⇒ 保持不动")
                 tr.note_ok(); return
-        self._track_lost(f"证据不足（候选尺度 {[round(c, 3) for c in cands]} 都不过闸；{why_s}）")
+        msg = (f"证据不足（候选尺度 {[round(c, 3) for c in cands]} 都不过闸；{why_s}）")
+        self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} → 全平移 候选"
+                         f"{[round(c, 3) for c in cands]} 全不过闸（旧分"
+                         f"{'None' if sc_near is None else f'{sc_near:.3f}'}）→ 判丢")
+        self._track_lost(msg, is_open)
 
     def _track_adopt(self, M, s, why):
         """接受新变换：过死区才重烘焙投影（省掉一次 warpAffine 1920×1080 + QPixmap）。"""
@@ -990,15 +1042,22 @@ class MainWindow(QWidget):
             self._track_log_t = now
             self._log_step(f"跟随: 投影跟着地图更新（{why}）")
 
-    def _track_lost(self, why):
-        """判丢：连忍 TRACK_LOST_MAX 次才动投影 —— 判丢后**隐藏**而不是留着错位置。"""
+    def _track_lost(self, why, is_open=True):
+        """判丢：连忍 TRACK_LOST_MAX 次才动投影 —— 判丢后**隐藏**而不是留着错位置。
+
+        `_last_rgba` 只在**地图确实开着**时清（`is_open` = 本 tick 的原始读数）。理由：它是
+        「G 重开地图放回哪张」的唯一来源，而 G 的关闭动画帧也会走到判丢（见 `_track_tick`
+        开头）；那种「丢」是假的，把图清了就再也放不回来（2026-09-18 bug①）。地图开着还判丢
+        才是真丢 —— 那时光是错的，清掉正合「粘在错位置比空白有害」。
+        """
         tr = self._track
         n = tr.note_lost()
         self._track_idle = 0
         if n < TRACK_LOST_MAX:
             return
         self._set_overlay_visible(False)
-        self._last_rgba = None      # 不留旧的：G 重开地图时也不许把错位置放回来
+        if is_open:
+            self._last_rgba = None  # 真丢（地图开着）⇒ 不留旧的，G 重开也别把错位置放回来
         tr.reset()
         self._log_step(f"跟丢（{why}）→ 已隐藏投影，请按热键重新匹配", "WARN")
 
