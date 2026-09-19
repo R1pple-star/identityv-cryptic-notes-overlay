@@ -50,7 +50,7 @@
 ### 阶段 C：多分辨率适配（C1/C2 done 2026-09-12，C3 等样本）
 - ~~C1 `detect_fog_panel` 动态化（雾色连通块）~~ **已实测证伪**：雾态下面板边缘两侧同为深色不可见（局部放大无分界线），雾块 bbox 随探明状态漂移 dx −288~+480；暗块/亮线密封暗块均被游戏场景连通吞整屏。测量见 `experiments/diag_panel_dynamic.py`、`diag_panel_window.py`（38张真实截图）。
 - **C1(改) `panel_for_screen(w,h)` 比例适配**：1920×1080 精确返回 FIXED_PANEL（零回归 by construction）；config `[panel.rects]` 每分辨率校准表优先；同 16:9 按 W/1920 等比外推（右/下边缘取整回推宽高）；非 16:9 未校准返回 None。`detect_fog_panel(shot)` 改为其薄封装，雾块路径已删。
-- **C2 done**：app.py 全调用点接线（入口管线/手框/两段对齐/重对齐/居中显示/启动日志），eval_match/verify_entrance_e2e 改走 `panel_for_screen`（1920 下同值，覆盖新路径）。回归：eval 2/2/0%、verify_follow 6/6、e2e 分数逐值一致；offscreen 冒烟 `experiments/smoke_app_offscreen.py`。
+- **C2 done**：app.py 全调用点接线（入口管线/手框/两段对齐/重对齐/居中显示/启动日志），eval_match/verify_entrance_e2e 改走 `panel_for_screen`（1920 下同值，覆盖新路径）。回归：eval 2/2/0%、verify_follow 6/6、e2e 分数逐值一致；offscreen 冒烟 `eval/smoke_app_offscreen.py`。
 - C3 不同分辨率真实截图测（阻塞：需用户提供非1920×1080 截图+种子标注；外推值未实测，16:9 也需验证游戏 UI 是否真等比）。
 - C4 DPI 缩放一致性 ✓（b704f35 已做）。
 
