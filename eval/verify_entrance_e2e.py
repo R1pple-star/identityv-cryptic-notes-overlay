@@ -3,6 +3,7 @@
 对确认样本跑全流程，看：① 入口匹配定对种子没 ② 自动重合 overlap 合不合理。
 """
 import sys
+import tomllib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -14,8 +15,10 @@ from core.vision import load_bgr, panel_for_screen, _find_icon
 from core.entrance import find_seed_by_entrance, ENTRANCE_FLOOR, build_entrance_transform, load_index
 from core.alignment import find_overlay_transform
 
-MAP_DIR = r"D:\Pictures\20260818摸金地图"
-SHOT_DIR = r"D:\Videos\NVIDIA\IdentityV"
+with open(Path(__file__).resolve().parent.parent / "config.toml", "rb") as _f:
+    _CFG = tomllib.load(_f)
+MAP_DIR = _CFG["paths"]["map_library"]
+SHOT_DIR = _CFG["paths"]["shot_library"]
 GT = [("26", "17.13.06.98", 18), ("26", "17.11.35.17", 18),
       ("26", "01.11.13.38", 27), ("26", "16.42.33.89", 9)]
 

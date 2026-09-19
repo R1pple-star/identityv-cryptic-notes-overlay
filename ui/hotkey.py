@@ -153,26 +153,6 @@ def parse_hotkey(s: str) -> tuple[int, int]:
     return int(vk), int(mods)
 
 
-def format_hotkey(vk: int, mods: int) -> str:
-    """(vk, mods) -> 'Ctrl+Shift+F'。"""
-    import win32con
-    names = []
-    for tok, m in (("Ctrl", MOD_CONTROL), ("Shift", MOD_SHIFT),
-                   ("Alt", MOD_ALT), ("Win", MOD_WIN)):
-        if mods & m:
-            names.append(tok)
-    keyname = None
-    for name in dir(win32con):
-        if name.startswith("VK_") and getattr(win32con, name) == vk:
-            keyname = name[3:]
-            break
-    if keyname is None and 0x30 <= vk <= 0x5A:  # 0-9 / A-Z
-        keyname = chr(vk)
-    if keyname is None:
-        keyname = f"vk{vk}"
-    return "+".join(names + [keyname])
-
-
 if __name__ == "__main__":
     # 自检：注册 F8，打印说明（不实际触发）
     import win32con

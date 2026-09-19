@@ -47,8 +47,6 @@ from __future__ import annotations
 
 import math
 
-from core.alignment import ALIGN_SCALES
-
 # ---- 判据阈值（改动前请先看 experiments/e38_scale_policy.py / e36_scale_band.py）----
 TRACK_OK = 0.20           # 探针分低于此值 ⇒ 旧变换仍然对得上，不需要跳
 TRACK_ACCEPT = 0.30       # 接受新变换的绝对闸（与 config [match].align_score_max 同源）
@@ -64,12 +62,9 @@ TRACK_MOTION_MAD = 1.2    # 面板降采样帧差低于此值（灰度级）视�
 TRACK_ICON_SCORE_MIN = 0.65   # 图标尺子的可用门槛：`_find_icon` 的 NCC 低于此值时 k 不可信
                               # （滑条读不到时才量图标，实测 09-18 那批 0.80~0.93）
 TRACK_RULER_K_STEP = 0.05     # `_find_icon` 的尺度网格步长（见 vision._find_icon）
-TRACK_SCALE_BAND = 0.05   # 滑条给出的尺度只信到这个半宽；超出就在滑条值周围带内重扫
 TRACK_IDLE_INTERVAL_MS = 1000   # 投影没动时的探针周期（动了立刻回到全速）
 TRACK_LOG_MIN_SEC = 1.5   # 跟踪成功日志的最小间隔（拖动时别刷屏）
 TRACK_BEAT_MIN_SEC = 1.5  # 跟踪**心跳**日志的最小间隔（每 tick 走哪条路；2026-09-18 立）
-# 合法尺度域（防滑条读数离谱时把搜索带出域）
-SCALE_LO, SCALE_HI = float(ALIGN_SCALES[0]), float(ALIGN_SCALES[-1])
 
 
 def verdict(score_prev, score_new, ov_new):
@@ -102,17 +97,6 @@ def ruler_slop(s_k, k):
     （实测同一圆点位置 k=0.45 与 0.50 都出现过）会让 s 抖 0.08，每 tick 都触发全平移搜索。
     """
     return max(0.02, float(s_k) * TRACK_RULER_K_STEP / max(float(k), 1e-6))
-
-
-def band_around(s, half=TRACK_SCALE_BAND, step=0.025):
-    """以 s 为中心、半宽 ±half 的尺度带（步长步进，钳在合法域内，去重保序）。"""
-    out, x = [], s - half
-    while x <= s + half + 1e-9:
-        v = round(min(max(x, SCALE_LO), SCALE_HI), 3)
-        if not out or abs(v - out[-1]) > 1e-9:
-            out.append(v)
-        x += step
-    return tuple(out)
 
 
 class Tracker:

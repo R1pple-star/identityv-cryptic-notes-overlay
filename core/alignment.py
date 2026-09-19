@@ -15,7 +15,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from core.vision import (FIXED_PANEL, FOG_BGR, classify_region,
+from core.vision import (FIXED_PANEL, FOG_BGR, FOG_TOL, classify_region,
                          consistent_cost, content_bbox, to_match3, walls_as_floors)
 
 
@@ -74,7 +74,7 @@ def _revealed_mask(region, cls_r):
     迷雾色 BGR(58,47,37) 冷暖度 -21，会被 classify_region 误判成「通路(cls=3)」。
     用颜色距离(FOG_BGR, tol24)显式剔除迷雾，避免迷雾污染模板。
     """
-    fog = (np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
+    fog = (np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < FOG_TOL)
     return (((cls_r == 1) | (cls_r == 2) | (cls_r == 3)) & (~fog)).astype(np.uint8)
 
 

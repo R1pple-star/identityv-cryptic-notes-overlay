@@ -26,8 +26,11 @@ def _load_config():
     """读 config.toml 的面板坐标与图标模板路径；失败兜底硬编码默认（绝不崩，保证 import 安全）。"""
     defaults = {
         "panel_rect": (668, 166, 1064, 569),
+        "panel_res": (1920, 1080),
         "icon_template": "_icon_entrance.png",
         "nav_template": "assets/ui_nav_column.png",
+        "fog_bgr": (58, 47, 37),
+        "fog_tol": 24,
     }
     try:
         with open(_CONFIG_PATH, "rb") as f:
@@ -38,6 +41,8 @@ def _load_config():
                                    for k, v in cfg["panel"].get("rects", {}).items()}
         defaults["icon_template"] = cfg["paths"]["icon_template"]
         defaults["nav_template"] = cfg["paths"].get("nav_template", defaults["nav_template"])
+        defaults["fog_bgr"] = tuple(cfg["vision"].get("fog_bgr", defaults["fog_bgr"]))
+        defaults["fog_tol"] = int(cfg["vision"].get("fog_tol", defaults["fog_tol"]))
     except Exception:
         pass
     return defaults
@@ -102,7 +107,10 @@ def load_bgr(path: str) -> np.ndarray:
 
 
 # 游戏内地图迷雾的颜色（BGR 顺序）。RGB(37,47,58) -> BGR(58,47,37)
-FOG_BGR = np.array([58, 47, 37], dtype=np.int16)
+# 值与容差来自 config.toml [vision]（fog_bgr / fog_tol），缺配置时用同值默认兜底。
+# 迷雾是冷色不是中性灰 —— 一切 revealed 判定必须按它剔除（CLAUDE.md 硬约束）。
+FOG_BGR = np.array(_CFG["fog_bgr"], dtype=np.int16)
+FOG_TOL = int(_CFG["fog_tol"])
 
 # 墙色标定（2026-09-15 用户提供纯色块样本 D:\yanshi 实测，双侧均验证出墙线网络）：
 #   通路墙 BGR(138,119,111) 亮度119 冷-27（旧分类落 cls3=通路）
@@ -231,11 +239,6 @@ def classify_region(region):
     return cls
 
 
-def classify_map(bgr):
-    """兼容旧名，直接用 R-B 分类。"""
-    return classify_region(bgr)
-
-
 def _find_icon(bgr, px, py, pw, ph,
                scales=None):
     """在面板内找白色箭头入口图标（排除黄色玩家图标）。多尺度，能抓到随地图缩放缩小的图标。
@@ -302,7 +305,7 @@ def follow_features(region):
     """
     cls = classify_region(region)
     content = float((cls != 0).mean())
-    fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24).mean())
+    fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < FOG_TOL).mean())
     struct = float(((cls == 2) | (cls == 3) | (cls == 5)).mean())
     return content, fog, struct
 
@@ -404,7 +407,7 @@ def map_open_from_roi(roi_bgr, panel=FIXED_PANEL):
     px, py, pw, ph = panel
     rx, ry, _x1, _y1 = map_roi(panel)
     region = roi_bgr[py - ry:py - ry + ph, px - rx:px - rx + pw]
-    fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < 24).mean())
+    fog = float((np.abs(region.astype(np.int16) - FOG_BGR).sum(axis=2) < FOG_TOL).mean())
     if ncc is None:
         return fog >= FOG_OPEN_MIN, f"导航列模板缺失→雾{fog:.2f}", False
     if ncc >= NAV_NCC_MIN:

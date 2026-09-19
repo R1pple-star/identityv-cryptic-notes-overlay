@@ -17,6 +17,7 @@
   E) 低探明鲁棒性：把 17.13 的探明随机抹掉 70%(留真实像素)，全搜仍应恢复
      同一变换(<3px)——跟随循环里探明增长/掩膜变化不影响稳定。"""
 import sys
+import tomllib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -28,8 +29,10 @@ from core.map_library import MapLibrary
 from core.vision import FIXED_PANEL, classify_region, load_bgr
 from core.alignment import map_to_overlay_rgba
 
-MAP_DIR = r"D:\Pictures\20260818摸金地图"
-SHOT_DIR = r"D:\Videos\NVIDIA\IdentityV"
+with open(Path(__file__).resolve().parent.parent / "config.toml", "rb") as _f:
+    _CFG = tomllib.load(_f)
+MAP_DIR = _CFG["paths"]["map_library"]
+SHOT_DIR = _CFG["paths"]["shot_library"]
 RNG = np.random.default_rng(42)
 
 

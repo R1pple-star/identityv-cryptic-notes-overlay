@@ -10,7 +10,7 @@
 识别(find_seed_submap / find_seed_color / detect_direction)已删，全部走入口引索 + 两段式对齐。
 
 双闸（见 CLAUDE.md）：
-  入口置信闸 = 入口分 < score_confident(0.10) 且 overlap ≥ overlap_min(0.40)（种子ID可信）
+  入口置信闸 = 入口分 < score_confident(0.45) 且 overlap ≥ overlap_min(0.40)（种子ID可信）
   对齐显示闸 = 重合分 < align_score_max(0.30) 且 overlap ≥ 0.40（投影该显示）
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ from ui.capture import capture_monitor, capture_region, monitor_size
 from ui.follow import (
     FOLLOW_IDLE_INTERVAL_MS, FOLLOW_INTERVAL_MS, FOLLOW_MAX_CAPTURE_ERRORS, FollowState,
 )
-from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
+from ui.hotkey import HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
 from ui.preview import SamplePreview

@@ -44,10 +44,6 @@ class MapInfo:
         """方向+门特征 的唯一标识（肉眼识别种子用的线索）。"""
         return f"{self.direction}-{self.door}"
 
-    @property
-    def floor_key(self) -> str:
-        return self.floor
-
 
 @dataclass
 class MapLibrary:
@@ -106,39 +102,10 @@ class MapLibrary:
         """所有方向（北/南/左/右）。"""
         return sorted({i.direction for floors in self.maps.values() for i in floors.values()})
 
-    def door_features(self) -> list[str]:
-        """所有门特征名。"""
-        return sorted({i.door for floors in self.maps.values() for i in floors.values()})
-
     def doors_for_direction(self, direction: str) -> list[str]:
         """某方向下所有门特征名（用于过滤门下拉）。"""
         return sorted({i.door for floors in self.maps.values()
                        for i in floors.values() if i.direction == direction})
-
-    def seeds_for_direction(self, direction: str) -> list[int]:
-        """某方向下的所有种子号。"""
-        return sorted(s for s, floors in self.maps.items()
-                      if any(i.direction == direction for i in floors.values()))
-
-    def direction_of(self, seed: int) -> str | None:
-        """某个种子的方向（取任一楼层）。"""
-        floors = self.maps.get(seed)
-        if not floors:
-            return None
-        return next(iter(floors.values())).direction
-
-    def candidates_by_clue(self, direction: Optional[str] = None,
-                           door_keyword: Optional[str] = None) -> list[int]:
-        """按线索模糊筛选候选种子（用于 UI 里让用户点选）。"""
-        out: list[int] = []
-        for seed, floors in sorted(self.maps.items()):
-            any_floor = next(iter(floors.values()))
-            if direction and any_floor.direction != direction:
-                continue
-            if door_keyword and door_keyword not in any_floor.door:
-                continue
-            out.append(seed)
-        return out
 
 
 def parse_filename(name: str) -> Optional[MapInfo]:
@@ -153,19 +120,3 @@ def parse_filename(name: str) -> Optional[MapInfo]:
     return MapInfo(seed=seed, direction=direction, door=door, floor=floor,
                    path=Path(name))
 
-
-if __name__ == "__main__":
-    # 自检：打印解析结果
-    import sys
-    default_dir = r"D:\Pictures\20260818摸金地图"
-    d = sys.argv[1] if len(sys.argv) > 1 else default_dir
-    lib = MapLibrary.load(d)
-    print(f"地图目录: {d}")
-    print(f"共解析 {len(lib.maps)} 个种子，跳过 {len(getattr(lib, 'skipped', []))} 个文件")
-    for seed in lib.seeds():
-        floors = lib.floors_for(seed)
-        sample = lib.get(seed, floors[0]) if floors else None
-        print(f"  种子 {seed:>2}: 楼层={floors}  线索={sample.key if sample else '?'}")
-    print("\n线索反查表:")
-    for clue, seed in sorted(lib.clue_to_seed.items(), key=lambda x: x[1]):
-        print(f"  {clue!r} -> 种子 {seed}")

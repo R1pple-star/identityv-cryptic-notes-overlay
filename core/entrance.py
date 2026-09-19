@@ -21,7 +21,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.vision import (FIXED_PANEL, FOG_BGR, _find_icon, classify_region,
+from core.vision import (FIXED_PANEL, FOG_BGR, FOG_TOL, _find_icon, classify_region,
                          load_bgr, walls_as_floors)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -123,7 +123,7 @@ def sample_structure(crop):
     现在走墙重合度量，只吃两侧的墙掩膜（classify_region(...)==5）。"""
     cls_raw = classify_region(crop)
     cls = walls_as_floors(cls_raw, crop)
-    fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < 24)
+    fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < FOG_TOL)
     if _FOG_DILATE > 0:
         fog = cv2.dilate(fog.astype(np.uint8),
                          np.ones((_FOG_DILATE, _FOG_DILATE), np.uint8)) > 0
@@ -307,25 +307,3 @@ def build_entrance_transform(best, entrance_type: str, index_json: dict,
     M1 = np.array([[a, 0.0, tx], [0.0, a, ty]], dtype=np.float64)
     return M1, s
 
-
-if __name__ == "__main__":
-    import sys
-    from core.map_library import MapLibrary
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    lib = MapLibrary.load(r"D:\Pictures\20260818摸金地图")
-    # 已知正确种子(用户确认)，测各入口类型能否定到
-    GT = [("26", "17.13.06.98", 18), ("26", "17.11.35.17", 18),
-          ("26", "01.11.13.38", 27), ("26", "16.42.33.89", 9)]
-    for dt, ts, seed in GT:
-        p = rf"D:\Videos\NVIDIA\IdentityV\IdentityV Screenshot 2026.08.{dt} - {ts}.png"
-        shot = load_bgr(p)
-        print(f"\n=== {ts} 真种子{seed} ===")
-        for et in ("正门", "侧门", "二楼"):
-            res, ip, isc, _k = find_seed_by_entrance(shot, lib, et, top_n=3)
-            if not res:
-                print(f"  [{et}] 图标未检出/无匹配 (图标分{isc:.2f})")
-                continue
-            s = " | ".join(f"{c[2]}[{c[3]}]={c[0]:.3f}" + (" <==真" if c[1] == seed else "")
-                           for c in res)
-            hit = "✓" if res[0][1] == seed else "✗"
-            print(f"  [{et}] 图标{isc:.2f}@{ip} {hit} {s}")
