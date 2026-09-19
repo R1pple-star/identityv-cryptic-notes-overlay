@@ -6,8 +6,11 @@ __pycache__/
 # 运行时产物
 captures/
 校准输出/
-图标检测检查/
 experiments/
+
+# 运行时用户状态 / 本机环境
+settings.json
+.claude/
 
 # 一次性诊断脚本的可再生视觉产物
 _cmp_*.png
