@@ -41,20 +41,21 @@ from core.entrance import (
 )
 from core.map_library import MapLibrary
 from core.vision import (_find_icon, FOG_OPEN_MIN, NAV_NCC_MIN, detect_fog_panel, load_bgr,
-                         map_is_open, map_open_from_roi, map_roi, panel_for_screen,
+                         map_is_open, map_open_from_roi, map_roi, panel_for_screen, roi_of,
                          zoom_scale_from_k, zoom_scale_from_roi)
 from ui.capture import capture_monitor, capture_region, monitor_size
 from ui.follow import (
-    FOLLOW_IDLE_INTERVAL_MS, FOLLOW_INTERVAL_MS, FollowState,
+    FOLLOW_IDLE_INTERVAL_MS, FOLLOW_INTERVAL_MS, FOLLOW_MAX_CAPTURE_ERRORS, FollowState,
 )
 from ui.hotkey import MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey
 from ui.manage_materials import ManageMaterialsDialog
 from ui.overlay import MapOverlay
 from ui.preview import SamplePreview
 from ui.settings import Settings, SettingsDialog, load as load_settings, save as save_settings
-from ui.track import (TRACK_BEAT_MIN_SEC, TRACK_ICON_SCORE_MIN, TRACK_IDLE_INTERVAL_MS,
-                      TRACK_LOG_MIN_SEC, TRACK_LOST_MAX, TRACK_MOTION_MAD, TRACK_NEAR_R,
-                      TRACK_OK, Tracker, ruler_slop, verdict)
+from ui.track import (TRACK_BEAT_MIN_SEC, TRACK_DEADBAND_S, TRACK_ICON_SCORE_MIN,
+                      TRACK_IDLE_INTERVAL_MS, TRACK_LOG_MIN_SEC, TRACK_LOST_MAX,
+                      TRACK_MOTION_MAD, TRACK_NEAR_R, TRACK_OK, TRACK_OVERLAP_MIN,
+                      Tracker, ruler_slop, verdict)
 
 # DPI 缩放适配：让进程用物理像素（per-monitor DPI aware + Qt 禁用 high-DPI scaling），
 # 使 mss 截屏、Qt 窗口坐标、面板坐标(panel_for_screen) 三者统一于物理像素。否则 125%/150% 缩放下
@@ -240,6 +241,7 @@ class MainWindow(QWidget):
         self._mad_peak = 0.0              # 上一次心跳以来 `帧差` 的**峰值**（心跳只记瞬时值会漏掉尖峰）
         self._track_n = 0                 # 上一次心跳以来 `_track_tick` 真跑了几次（分母）
         self._panel_prev = None           # 面板降采样上一帧（画面没动就整段跳过，省 ~70ms/次）
+        self._track_err = 0               # 跟踪主体抛异常次数（见 _maybe_track 的兜底）
         self._screen_wh = None            # 屏幕尺寸缓存（避免每 tick 新建/销毁 mss DC 句柄）
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint
@@ -583,18 +585,57 @@ class MainWindow(QWidget):
         # 回退：全搜（baseline verify_entrance_e2e 证 17.13/17.11 全搜可靠）
         return find_overlay_transform(shot, ref, panel)
 
+    def _realign_hints(self, shot, panel) -> tuple:
+        """「按此种子对齐」的 hint：与热键路径同源 —— `hint_s` 尺度提示 + `hint_icon` 图标锚点。
+
+        `hint_s` 取**缩放滑条读数**（`zoom_scale_from_roi`，±0.01，全量程已标定）而不是
+        「挑分最小的尺度」：分对尺度是单调偏低的（技术备忘⑥），挑分必然挑到更小的那个。
+        读不到滑条（窗口化布局，导航列 NCC 掉到 0.34 < 闸 0.45）时回退图标尺子 `0.374/k`。
+        """
+        s_ui, _why = zoom_scale_from_roi(roi_of(shot, panel), panel)
+        icon_pos, isc, k = _find_icon(shot, *panel)
+        if s_ui is None and icon_pos is not None:
+            s_k = zoom_scale_from_k(k) if (isc or 0) >= TRACK_ICON_SCORE_MIN else None
+            s_ui = s_k
+        return s_ui, icon_pos
+
     def _realign(self):
-        """用当前选定的方向+门+楼层重新对齐（全搜，无入口 hint）。"""
+        """用当前选定的方向+门+楼层重新对齐（**当场截屏** + 与热键同源的两段式）。
+
+        2026-09-19 修两处（用户报「点『按此种子对齐』按钮对齐也是不准的」）：
+
+        ① **必须当场重新截屏**。旧写法 `if self._shot is None and not self._capture()`
+           只在从未截过屏时抓一张 ⇒ 按钮对齐的其实是**上一次热键那张旧图**，投影于是落在
+           「地图当时所在」的位置。实机日志的指纹很干净：`手动重对齐: 南-三缺一门
+           重合0.05 重叠1.00 已投影` 在 4 分钟里出现 **8 次**（15:40:00/06/14/18、
+           15:42:43/54/57/59），**分数与重叠一字不差** —— 中间地图已挪过好几处，只有
+           「同一张旧图 + 同一个变换」才会给出逐位相同的结果。
+
+        ② **把热键路径的对齐方式搬过来**（用户 2026-09-19 提的正是这句）。旧写法是无锚点
+           无尺度提示的全搜，而全搜在**这一帧**上就给出骗人的答案：实测
+           `captures/hotkey_20260919_154124.png` 全搜得 s≈0.39 / 分0.038 / 重叠1.00
+           （**过闸**），真值是 s≈0.83（图标尺子 0.374/k，k=0.45）—— 技术备忘① 的
+           「缩模板骗分」在尺度轴上重演：模板缩小 ⇒ 不一致像素被一起缩掉 ⇒ 分更低。
+           热键路径靠 `hint_s`（入口匹配尺度）+ `hint_icon`（图标钉死平移）双重约束才稳，
+           这里同样给（见 `_realign_hints`）。两者缺失只是退化成「少一层约束」；都不过对齐
+           显示闸就**回退全搜**，等于旧行为，不会更差。
+        """
         info = self._current_map()
         if info is None:
             self.status.setText("请先选好方向+门"); return
-        if self._shot is None and not self._capture():
+        if not self._capture():
             return
-        panel = detect_fog_panel(self._shot)
+        shot = self._shot
+        panel = detect_fog_panel(shot)
         if panel is None:
             self.status.setText("屏幕分辨率未适配（非16:9且未校准）"); return
-        ref = load_bgr(str(info.path))
-        align = find_overlay_transform(self._shot, ref, panel)
+        # 复用热键路径的 `_two_stage_align`（hint 精修 → 过闸即用 → 回退全搜），零重复。
+        # `best` 是入口层结果的元组 (score, seed, key, floor, s, mloc)：这里没有入口层匹配
+        # （种子是用户手选的），就把**滑条/尺子量出来的尺度**放进 `s` 槽 —— 它在这一段的
+        # 唯一用途就是当 `hint_s`（见 build_entrance_transform），语义正好对得上。
+        hint_s, icon_pos = self._realign_hints(shot, panel)
+        best = (0.0, self._seed, info.key, info.floor, hint_s, None)
+        align = self._two_stage_align(shot, best, self.entrance_combo.currentText(), icon_pos)
         if align is None:
             self.status.setText("对齐失败：探明不足"); return
         M, asc, ov = align
@@ -911,7 +952,20 @@ class MainWindow(QWidget):
             step = max(1, TRACK_IDLE_INTERVAL_MS // FOLLOW_INTERVAL_MS)
             if self._track_idle % step:
                 return
-        self._track_tick(roi, is_open, nav_ok)
+        try:
+            self._track_tick(roi, is_open, nav_ok)
+        except Exception as e:  # noqa: BLE001
+            # 跟踪主体**必须自己报错**，不许静默死掉。
+            # 2026-09-19 查出的实机病根就是这个：`ui.track` 的 `TRACK_DEADBAND_S` /
+            # `TRACK_OVERLAP_MIN` 与 `ui.follow` 的 `FOLLOW_MAX_CAPTURE_ERRORS` **没进
+            # app.py 的 import 列表** ⇒ 自 `1b888e7`（跟随·第二步）起每次过闸都在写第一行
+            # 日志之前抛 `NameError`，traceback 只进 stderr（用户看不到），心跳里只剩
+            # 「帧差…画面没动」⇒ 实机 56 次过闸、零条输出。技术备忘③ 同款教训：
+            # **走不到那条分支**等于没有记录，先让失败可见。
+            self._track_err += 1
+            if self._track_err <= 3 or self._track_err % 50 == 0:
+                self._log_step(f"跟踪内部异常 #{self._track_err}"
+                               f"（{type(e).__name__}: {e}）→ 本 tick 丢弃，跟随继续", "ERROR")
 
     def _track_beat(self, msg: str, force: bool = False):
         """跟踪**心跳**：把「这一 tick 走了哪条路」写进日志（限流 `TRACK_BEAT_MIN_SEC`）。
@@ -960,12 +1014,16 @@ class MainWindow(QWidget):
         small = cv2.resize(region, (64, 34), interpolation=cv2.INTER_AREA).astype(np.int16)
         prev, self._panel_prev = self._panel_prev, small
         mad = float(np.abs(small - prev).mean()) if prev is not None else None
+        # `mad is None` = 本次跟随的**第一** tick（`_panel_prev` 刚被 `_start_follow` 清成 None）。
+        # 它不过闸（没有上一帧可比，就当"动过"），于是会走到下面那条路 —— 那里所有日志都用
+        # `{mad_s}` 而不是 `{mad_s}`：`None:.2f` 会抛 TypeError（2026-09-19 一并修）。
+        mad_s = "--" if mad is None else format(mad, ".2f")
         # 心跳限流 1.5s = 每 6 个 tick 才记 1 条，而一次拖缩放往往只有 1 秒（4 个 tick）
         # ⇒ 只记瞬时值必然漏掉尖峰（09-18 第二份日志 35 条心跳全是 0.00 就是这么来的）。
         # 记**本轮峰值**：只要这 1.5s 里有过 4.30，就一定会出现在日志里。
         self._mad_peak = max(self._mad_peak, mad or 0.0)
         if mad is not None and mad < TRACK_MOTION_MAD:
-            self._track_beat(f"帧差{mad:.2f}<闸{TRACK_MOTION_MAD} 画面没动 → 跳过（不重对齐）"
+            self._track_beat(f"帧差{mad_s}<闸{TRACK_MOTION_MAD} 画面没动 → 跳过（不重对齐）"
                              f"｜本轮峰值{self._mad_peak:.2f} / {self._track_n} tick")
             tr.note_ok()
             return
@@ -1000,7 +1058,7 @@ class MainWindow(QWidget):
                                           hint_radius=TRACK_NEAR_R, ref_key=tr.ref_path)
             sc_near = near[1] if near is not None else None
             if near is not None and sc_near < TRACK_OK and near[2] >= TRACK_OVERLAP_MIN:
-                self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} s={tr.s:.3f} "
+                self._track_beat(f"帧差{mad_s} 尺度源{s_src} s={tr.s:.3f} "
                                  f"→ 小窗(±{TRACK_NEAR_R}px) 分{sc_near:.3f} ov{near[2]:.2f} 采纳",
                                  force=True)
                 self._track_adopt(near[0], tr.s, "平移")
@@ -1013,7 +1071,7 @@ class MainWindow(QWidget):
         #      小窗（±12px）是有界的、且要过 TRACK_OK 才采纳，所以上面试完就可以收手了；
         #      连丢 TRACK_LOST_MAX 次会隐藏投影 —— 与「宁可什么都不给」一致（待办 1）。
         if s_ui is None:
-            self._track_beat(f"帧差{mad:.2f} 尺度源无（{why_s}）→ 判丢", force=True)
+            self._track_beat(f"帧差{mad_s} 尺度源无（{why_s}）→ 判丢", force=True)
             self._track_lost(f"没有可信的尺度（{why_s}）", is_open, trusted)
             return
 
@@ -1030,7 +1088,7 @@ class MainWindow(QWidget):
                 continue
             v = verdict(sc_near, r[1], r[2])
             if v == "accept":
-                self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} s={s:.3f} "
+                self._track_beat(f"帧差{mad_s} 尺度源{s_src} s={s:.3f} "
                                  f"→ 全平移 分{r[1]:.3f} ov{r[2]:.2f}（旧分"
                                  f"{'None' if sc_near is None else f'{sc_near:.3f}'}）采纳",
                                  force=True)
@@ -1038,12 +1096,12 @@ class MainWindow(QWidget):
                                   f"（{s_src if s == s_ui else '沿用上次'}）")
                 return
             if v == "keep":
-                self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} s={s:.3f} "
+                self._track_beat(f"帧差{mad_s} 尺度源{s_src} s={s:.3f} "
                                  f"→ 全平移 分{r[1]:.3f} ov{r[2]:.2f} 不如旧位置 ⇒ 保持不动",
                                  force=True)
                 tr.note_ok(); return
         msg = (f"证据不足（候选尺度 {[round(c, 3) for c in cands]} 都不过闸；{why_s}）")
-        self._track_beat(f"帧差{mad:.2f} 尺度源{s_src} → 全平移 候选"
+        self._track_beat(f"帧差{mad_s} 尺度源{s_src} → 全平移 候选"
                          f"{[round(c, 3) for c in cands]} 全不过闸（旧分"
                          f"{'None' if sc_near is None else f'{sc_near:.3f}'}）→ 判丢", force=True)
         self._track_lost(msg, is_open, trusted)
