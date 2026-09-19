@@ -2,6 +2,8 @@
   "overlay_opacity": 0.57,
   "wall_alpha": 160,
   "hotkey": "Ctrl+Shift+F",
-  "show_log": true,
-  "sample_half_frac": 0.18
+  "show_log": false,
+  "sample_half_frac": 0.18,
+  "auto_follow": true,
+  "sample_preview_sec": 5.0
 }

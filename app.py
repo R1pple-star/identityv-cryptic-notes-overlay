@@ -25,8 +25,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QRect, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QRect, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox,
     QPlainTextEdit, QPushButton, QRubberBand, QSlider, QVBoxLayout, QWidget,
@@ -116,6 +116,30 @@ def _lead_frac(res) -> float | None:
 
 # 入口判别力降序：侧门/二楼房间形状各异（主要判别依据）；正门固定分不出种子。
 ENTRANCE_TYPES = ("侧门", "二楼", "正门")
+
+# 状态行的**像素**预算（T2b）。主窗定宽 300 − 左右边距 16 − 圆点 10 − 间距 5 − 余量。
+# 必须按像素截：一行放不下 56 个汉字（≈616px），旧的 `msg[:53]` 是按字数的，改成一行后
+# 会在字中间被硬切（用户截图里「建议手动确」就是这么来的）。
+STATUS_MAX_PX = 262
+
+# 折叠后指引用户去手动纠错的统一前缀（T2b）。这几个按钮已不在主窗，文案里直接写
+# 「手框样本/3点标定」会指向不存在的东西 —— 而日志窗默认关着，状态行只显示截断的一句话，
+# 用户更没地方去找。改文案时别退回裸按钮名。
+FIX_PATH = "⋯ 更多→手动纠错→"
+
+
+class _ClickLabel(QLabel):
+    """左键点击发 `clicked` 的 QLabel（状态行 / 「参考图」摘要行用）。
+
+    QLabel 没有 clicked 信号，而为这一处去装 eventFilter 或改基类都不划算。
+    """
+
+    clicked = Signal()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
 
 
 class ClickPicker(QDialog):
@@ -250,77 +274,96 @@ class MainWindow(QWidget):
         self.setWindowTitle("加页手记 地图助手")
         self.setFixedWidth(300)
 
-        # 状态灯：启动/热键成败一目了然（阶段1）
-        self.led = QLabel("● 启动中…")
-        self.led.setWordWrap(True)
-        self.led.setStyleSheet("color:#ffcc66; font-weight:bold; padding:5px; "
-                               "background:#222; border-radius:3px;")
-        # 运行日志区：逐步显示 截屏→图标→匹配→对齐→投影（阶段1）
+        # 状态灯（阶段1）：**缩成状态行左边一个 10px 圆点**（T2b）。原来它是一整条
+        # word-wrap 的文字（`● 已启动 · Ctrl+Shift+F 已注册` 能占两行），主窗被它顶掉一大截。
+        # 颜色语义不变（绿=正常 / 红=失败），文案搬进 tooltip，点它 = 热键状态。
+        self.led = QPushButton()
+        self.led.setFixedSize(10, 10)
+        self.led.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.led.clicked.connect(self._show_hotkey_status)
+        self._led_text = "启动中…"
+        # 运行日志区（阶段1）：**不再常驻主窗**，搬进懒创建的日志窗（T2b）。
+        # ⚠️ 对象仍归 MainWindow —— `_log_step` 的写入目标一个字没改；日志窗关闭**不销毁**
+        # `log_view`（QDialog 默认 close=hide），否则关着的那段日志全丢，而排查实机问题时
+        # 那是唯一的东西。`self._log_window` 由 `_show_log_window` 惰性建。
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(300)
-        self.log_view.setFixedHeight(150)
         self.log_view.setStyleSheet("background:#1a1a1a; color:#ccc; font-size:11px;")
-        self.log_view.setVisible(self.settings.show_log)
+        self._log_window: QDialog | None = None
+        self._ref_dialog: QDialog | None = None
 
         self.direction_combo = QComboBox(); self.direction_combo.addItems(lib.directions())
         self.door_combo = QComboBox()
         self.floor_combo = QComboBox(); self.floor_combo.addItems(["一楼", "二楼"])
         self.entrance_combo = QComboBox(); self.entrance_combo.addItems(list(ENTRANCE_TYPES))
-        self.seed_label = QLabel("")
+        # 「参考图」摘要行（T2b）：主窗上唯一显示「当前选的是哪个种子」的地方，点开
+        # → `_show_ref_picker()`（4 个下拉搬进对话框）。原独立的 `seed_label` 就是它。
+        self.seed_label = _ClickLabel("参考图: …")
+        self.seed_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.seed_label.setToolTip("点这里选 方向/门/楼层/入口（手动纠错用）")
+        self.seed_label.clicked.connect(self._show_ref_picker)
         self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
         self.door_combo.currentIndexChanged.connect(self._resolve_seed)
+        # 楼层也接上：摘要行里带楼层，不然改了楼层这行就陈旧了（`_seed` 本身只由方向+门决定）
+        self.floor_combo.currentIndexChanged.connect(self._resolve_seed)
 
-        # ---- UI改造B1：主界面只留高频按钮；低频(素材/标记错/设置/热键状态)进「⋯选项」菜单 ----
+        # ---- T2b 主窗 5 按钮（用户 09-19 定的清单，一个不折叠）----
+        # 折叠进「⋯ 更多」的只有：手框样本 / 手动选点 / 参考图 / 日志 / 回收 / 素材 / 设置 / 退出。
         self.btn_onematch = QPushButton("🔴 一键匹配（=热键）")
-        self.btn_onematch.setStyleSheet("font-weight:bold; padding:8px; background:#2a4a2a;")
+        self.btn_onematch.setStyleSheet("font-weight:bold; padding:10px; background:#2a4a2a;")
         self.btn_onematch.clicked.connect(self._entrance_pipeline)
-        self.btn_realign = QPushButton("▶ 按此种子对齐（用上面选的门）")
-        self.btn_picksample = QPushButton("✂ 手框样本匹配")
-        self.btn_calib = QPushButton("✋ 手动选点重合")
-        self.btn_hide = QPushButton("👁 隐藏地图")
-        self.btn_options = QPushButton("⋯ 选项")
-        self.btn_quit = QPushButton("✕ 退出")
+        self.btn_realign = QPushButton("▶ 按此种子重新对齐")
+        self.btn_realign.setToolTip("当场截屏，用上面「参考图」选的那个种子重跑两段式对齐（=热键的同一条路）")
         self.btn_realign.clicked.connect(self._realign)
-        self.btn_picksample.clicked.connect(self._manual_sample_pick)
-        self.btn_calib.clicked.connect(self._three_point_calib)
+        self.btn_swap = QPushButton("🔄 换种子")
+        self.btn_swap.setEnabled(False)   # T3 才接行为；先占位（见计划 §5 T3）
+        self.btn_swap.setToolTip("入口层选错种子时换下一个候选（未实现，暂不可用）")
+        self.btn_hide = QPushButton("👁 隐藏地图")
+        self.btn_options = QPushButton("⋯ 更多")
+        self.btn_swap.clicked.connect(self._swap_seed)
         self.btn_hide.clicked.connect(self._hide_overlay)
         self.btn_options.clicked.connect(self._show_options_menu)
-        self.btn_quit.clicked.connect(self._quit)
+        # 「✕ 退出」不再需要控件：它已进「⋯ 更多」菜单，直接连 `self._quit`。
 
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(20, 100)
         self.opacity_slider.setValue(int(self.settings.overlay_opacity * 100))
         self.opacity_slider.valueChanged.connect(self._set_opacity)
 
+        # ---- T2b 主窗布局：≈190px（原 ≈520/700）。只有 5 个按钮 + 参考图行 + 状态行 + 滑块 ----
         root = QVBoxLayout(); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(5)
-        root.addWidget(self.led)
         root.addWidget(self.btn_onematch)
-        root.addWidget(QLabel("── 手动纠错（自动出错时用）──"))
-        for text, widget in [("方向（入口朝向）", self.direction_combo),
-                             ("门特征", self.door_combo),
-                             ("楼层", self.floor_combo),
-                             ("入口(引索匹配用)", self.entrance_combo)]:
-            root.addWidget(QLabel(text)); root.addWidget(widget)
+        row_align = QHBoxLayout(); row_align.setSpacing(5)
+        row_align.addWidget(self.btn_realign, 3); row_align.addWidget(self.btn_swap, 2)
+        root.addLayout(row_align)
+        row_misc = QHBoxLayout(); row_misc.setSpacing(5)
+        row_misc.addWidget(self.btn_hide, 1); row_misc.addWidget(self.btn_options, 1)
+        root.addLayout(row_misc)
         root.addWidget(self.seed_label)
-        root.addWidget(self.btn_realign)
-        root.addWidget(self.btn_picksample)
-        root.addWidget(self.btn_calib)
-        misc = QHBoxLayout()
-        misc.addWidget(self.btn_hide); misc.addWidget(self.btn_options); misc.addWidget(self.btn_quit)
-        root.addLayout(misc)
-        root.addWidget(QLabel("地图透明度")); root.addWidget(self.opacity_slider)
-        self.status = QLabel("就绪。Ctrl+Shift+F 入口匹配（需先按 g 打开地图、刚进入口）。")
-        self.status.setStyleSheet("color:#aaa; word-wrap:break-word; font-size:11px;")
-        root.addWidget(self.status)
-        root.addWidget(QLabel("运行日志"))
-        root.addWidget(self.log_view)
-        root.addStretch(1)
+        # 状态行：**一行**，日志窗默认关着时它是主窗唯一的运行反馈 ⇒ 截断（按像素）+
+        # 悬停看全文 + 按 level 染色 + 点击开日志窗。圆点在它左边。
+        self.status = _ClickLabel("就绪。Ctrl+Shift+F 入口匹配（需先按 g 打开地图、刚进入口）。")
+        self.status.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.status.setToolTip("点一下打开运行日志窗")
+        self.status.clicked.connect(self._show_log_window)
+        _sf = QFont(); _sf.setPixelSize(11)   # 与 status 的 `font-size:11px` 对齐
+        self._status_fm = QFontMetrics(_sf)
+        row_status = QHBoxLayout(); row_status.setSpacing(5)
+        row_status.addWidget(self.led, 0, Qt.AlignmentFlag.AlignVCenter)
+        row_status.addWidget(self.status, 1)
+        root.addLayout(row_status)
+        row_op = QHBoxLayout(); row_op.setSpacing(5)
+        op_lab = QLabel("地图透明度"); op_lab.setStyleSheet("color:#aaa; font-size:11px;")
+        row_op.addWidget(op_lab); row_op.addWidget(self.opacity_slider, 1)
+        root.addLayout(row_op)
         self.setLayout(root)
         self.move(8, 60)
         self._on_direction_changed()
         if self.settings.auto_follow:
             self._start_follow()
+        if self.settings.show_log:   # 语义已改为「启动时是否打开日志窗」（T2b）
+            self._show_log_window()
 
     # ---- 无边框拖动 ----
     def mousePressEvent(self, e):
@@ -349,11 +392,16 @@ class MainWindow(QWidget):
     def _resolve_seed(self):
         direction = self.direction_combo.currentText()
         door = self.door_combo.currentText()
+        floor = self.floor_combo.currentText()
         self._seed = self.lib.find_by_clue(direction, door)
+        # T2b：这行现在是主窗的「参考图」摘要（点开 = 方向/门/楼层/入口对话框），
+        # 所以带上方向-门-楼层，让人不打开对话框也知道当前选的是哪张参考图。
         if self._seed is None:
-            self.seed_label.setText("未找到该门"); self.seed_label.setStyleSheet("color:#ff6666;")
+            self.seed_label.setText(f"参考图: {direction}-{door} 未找到 ▾")
+            self.seed_label.setStyleSheet("color:#ff6666; font-size:11px;")
         else:
-            self.seed_label.setText(f"→ 种子 {self._seed}"); self.seed_label.setStyleSheet("color:#66ff66;")
+            self.seed_label.setText(f"参考图: {direction}-{door} {floor} → 种子{self._seed} ▾")
+            self.seed_label.setStyleSheet("color:#88dd88; font-size:11px;")
 
     def _current_map(self):
         if not getattr(self, "_seed", None):
@@ -362,14 +410,27 @@ class MainWindow(QWidget):
 
     # ---- 状态灯 / 运行日志（阶段1）----
     def set_led(self, ok: bool, text: str):
-        """启动/热键成败状态灯。ok=True 绿，False 红。"""
+        """启动/热键成败状态灯。ok=True 绿，False 红。
+
+        T2b：从「占一整行的文字条」缩成状态行左边一个 10px 圆点，文案搬进 tooltip。
+        **调用点一个没删** —— 启动失败 / 热键被占用这类反馈全靠它，只是渲染方式变了。
+        """
+        self._led_text = text
         color = "#66ff66" if ok else "#ff6666"
-        self.led.setText(f"● {text}")
-        self.led.setStyleSheet(f"color:{color}; font-weight:bold; padding:5px; "
-                               f"background:#222; border-radius:3px;")
+        self.led.setStyleSheet(
+            f"QPushButton{{border:none; border-radius:5px; background:{color};}}")
+        self.led.setToolTip(f"● {text}\n（点一下看热键状态）")
 
     def _log_step(self, msg: str, level: str = "INFO"):
-        """一步运行日志：append 进日志区 + 同步 status 一句话。level: INFO/OK/WARN/ERROR。"""
+        """一步运行日志：append 进日志区 + 同步 status **那一行**。level: INFO/OK/WARN/ERROR。
+
+        T2b：日志区已搬进日志窗且默认关着 ⇒ **status 那一行是主窗唯一的运行反馈**，
+        所以这里做三件事补偿：
+        ① 按**像素**截断（`STATUS_MAX_PX`）而不是按字数 —— 一行放不下 56 个汉字，
+           旧的 `msg[:53]` 在单行布局下会在字中间硬切；
+        ② 全文进 tooltip（悬停看全）；
+        ③ 按 level 染色（黄/红 = 坏消息），日志窗关着时也能一眼看出这句是警告。
+        """
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         color = {"ERROR": "#ff6666", "WARN": "#ffcc66", "OK": "#66ff66"}.get(level, "#cccccc")
@@ -379,7 +440,20 @@ class MainWindow(QWidget):
         self.log_view.appendHtml(f'<span style="color:{color}">[{ts}] {html.escape(msg)}</span>')
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
-        self.status.setText(msg if len(msg) <= 56 else msg[:53] + "…")
+        self._set_status(msg, level)
+
+    def _set_status(self, msg: str, level: str = "INFO"):
+        """写状态行**那一行**：按像素截断 + tooltip 全文 + 按 level 染色。
+
+        ⚠️ 别再直接写 `self.status.setText(...)` —— 那是绕过截断/tooltip/配色的写法：
+        单行布局下会硬切在字中间，而且 tooltip 还留着**上一条**的内容（hover 出来是错的）。
+        全部走这里。
+        """
+        color = {"ERROR": "#ff6666", "WARN": "#ffcc66", "OK": "#66ff66"}.get(level, "#aaaaaa")
+        self.status.setStyleSheet(f"color:{color}; font-size:11px;")
+        self.status.setToolTip(msg)
+        self.status.setText(self._status_fm.elidedText(
+            msg, Qt.TextElideMode.ElideRight, STATUS_MAX_PX))
 
     # ---- 捕获 ----
     def _capture(self) -> bool:
@@ -426,7 +500,7 @@ class MainWindow(QWidget):
         et = self.entrance_combo.currentText()
         res, icon_pos, isc, icon_k = find_seed_by_entrance(shot, self.lib, et, panel=panel, top_n=3)
         if icon_pos is None:
-            self._log_step(f"入口图标未检出(分{isc:.2f}) → 手框样本/3点标定", "WARN")
+            self._log_step(f"入口图标未检出(分{isc:.2f}) → {FIX_PATH}手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         self._log_step(f"入口图标 @({icon_pos[0]},{icon_pos[1]}) 分{isc:.2f} k={icon_k}")
@@ -478,13 +552,13 @@ class MainWindow(QWidget):
             if _degenerate(res):
                 self._log_step(
                     f"样本单类占比{dom * 100:.0f}%（大片均匀走廊/未探明），扩大取样后仍无判别结构 → "
-                    "多探明周围结构后再按 / 手框含墙角结构的小块 / 3点标定", "WARN")
+                    f"多探明周围结构后再按 / {FIX_PATH}手框含墙角结构的小块 / 3点标定", "WARN")
                 self._log(et, res, icon_pos, isc, None, corrected=False)
                 return
             if retried:
                 self._log_step(f"扩大取样重试({sample.shape[1]}px)：单类降至{dom * 100:.0f}%，分差已拉开", "INFO")
         if not res:
-            self._log_step("入口匹配无结果 → 手框样本/3点标定", "WARN")
+            self._log_step(f"入口匹配无结果 → {FIX_PATH}手框样本/3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=False)
             return
         best = res[0]
@@ -503,7 +577,7 @@ class MainWindow(QWidget):
         # 退化防御：top1 与 top2 分差<0.001（多种子同分0.000）→ 样本无判别结构/图标假阳，不假阳报告
         if _degenerate(res):
             self._log_step(f"匹配退化(多种子同分 {sc:.3f}) → 样本无判别结构（均匀区/假阳图标），"
-                           "请手框含墙角结构的小块或3点标定", "WARN")
+                           f"请{FIX_PATH}手框含墙角结构的小块或3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=corrected)
             return
         if sc >= 1e8:  # 哨兵分兜底（find_seed_by_entrance 已跳过无尺度种子，此处防御）
@@ -544,7 +618,7 @@ class MainWindow(QWidget):
         confident = (sc < SCORE_CONFIDENT and ov is not None and ov >= OVERLAP_MIN)
         self._log(et, res, icon_pos, isc, align, corrected=corrected)
         ov_txt = f"{ov:.2f}" if ov is not None else "-"
-        self.status.setText(
+        self._set_status(
             f"入口{et}(图标{isc:.2f}) {score_desc(sc)} 重叠{ov_txt} → 种子{seed}({key}[{fl}])"
             + (" ✓确信已对齐" if (confident and show_ok)
                else (" 种子可信但未对齐（未投影）" if confident
@@ -560,7 +634,7 @@ class MainWindow(QWidget):
         ref = load_bgr(str(info.path))
         panel = detect_fog_panel(shot)
         if panel is None:
-            self.status.setText("屏幕分辨率未适配（非16:9且未校准）——3点标定仍可用")
+            self._set_status("屏幕分辨率未适配（非16:9且未校准）——3点标定仍可用")
             return None
         # 第一段：构造 M1 + 对齐尺度提示 hint_s（=入口匹配尺度 s）+ 图标锚点 hint_icon
         # （锚点约束第二段平移搜索——防自相似迷宫幽灵相位，见 find_overlay_transform 注）
@@ -622,13 +696,13 @@ class MainWindow(QWidget):
         """
         info = self._current_map()
         if info is None:
-            self.status.setText("请先选好方向+门"); return
+            self._set_status("请先选好方向+门"); return
         if not self._capture():
             return
         shot = self._shot
         panel = detect_fog_panel(shot)
         if panel is None:
-            self.status.setText("屏幕分辨率未适配（非16:9且未校准）"); return
+            self._set_status("屏幕分辨率未适配（非16:9且未校准）"); return
         # 复用热键路径的 `_two_stage_align`（hint 精修 → 过闸即用 → 回退全搜），零重复。
         # `best` 是入口层结果的元组 (score, seed, key, floor, s, mloc)：这里没有入口层匹配
         # （种子是用户手选的），就把**滑条/尺子量出来的尺度**放进 `s` 槽 —— 它在这一段的
@@ -637,17 +711,17 @@ class MainWindow(QWidget):
         best = (0.0, self._seed, info.key, info.floor, hint_s, None)
         align = self._two_stage_align(shot, best, self.entrance_combo.currentText(), icon_pos)
         if align is None:
-            self.status.setText("对齐失败：探明不足"); return
+            self._set_status("对齐失败：探明不足"); return
         M, asc, ov = align
         if asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN:
             rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
             self._show_overlay(rgba)
             self._seed_track(self._shot, self._seed, info.floor, info.path, M)
-            self.status.setText(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
+            self._set_status(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
             self._log_step(f"手动重对齐: {info.key} 重合{asc:.2f} 重叠{ov:.2f} 已投影", "OK")
         else:
             self._refuse(info.key, f"手动重对齐没过闸(重合{asc:.2f} 重叠{ov:.2f})")
-            self.status.setText(f"未投影：对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})｜{info.key}")
+            self._set_status(f"未投影：对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})｜{info.key}")
 
     def _three_point_calib(self):
         """手动兜底：3 点标定（affine_from_points，3 下点击必对）。
@@ -658,7 +732,7 @@ class MainWindow(QWidget):
             return
         info = self._current_map()
         if info is None:
-            self.status.setText("请先选好方向+门（确定参考图）"); return
+            self._set_status("请先选好方向+门（确定参考图）"); return
         ref = load_bgr(str(info.path))
         pk1 = ClickPicker(self._shot, 3, "点 3 个游戏内特征点（顺序自定）", parent=self)
         if not pk1.exec():
@@ -668,13 +742,13 @@ class MainWindow(QWidget):
             return
         M = affine_from_points(pk2.pts, pk1.pts)  # src=ref, dst=screen
         if M is None:
-            self.status.setText("3点标定失败（点不足）"); return
+            self._set_status("3点标定失败（点不足）"); return
         rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
         self._show_overlay(rgba)
         # 3 点标定走的是 affine_from_points —— **可能带旋转**，参数化与跟踪用的相似变换
         # 不同（跟踪只认 s/tx/ty），喂进去会算错。故显式断根，该投影不参与跟随重对齐。
         self._track.reset()
-        self.status.setText(f"3点标定投影：{info.key}")
+        self._set_status(f"3点标定投影：{info.key}")
 
     def _manual_sample_pick(self):
         """手动框选入口样本：在最近截图上拖矩形，作为 sample 重跑匹配（纠错）。"""
@@ -702,7 +776,7 @@ class MainWindow(QWidget):
             self._shot, self.lib, et, panel=panel, top_n=3, sample_crop=sample,
             sample_origin=(x0, y0))
         if not res:
-            self._log_step("手框样本仍无匹配 → 换一处含墙角/房间边缘的区域再框，或用3点标定", "WARN")
+            self._log_step(f"手框样本仍无匹配 → 换一处含墙角/房间边缘的区域再框，或用{FIX_PATH}3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=True)
             return
         best = res[0]
@@ -797,8 +871,8 @@ class MainWindow(QWidget):
         比例都不对」就是它，不是对齐结果。宁可什么都不给，也不给一张像是对的的假图：
         假图会让人以为算法定位到了别处，比空白有害得多。
 
-        种子ID仍写进状态栏与日志（那个数是有意义的）；想看参考图请显式用
-        「▶ 按此种子对齐」（全搜）或「✋ 手动选点重合」（3 点标定）。
+        种子ID仍写进状态栏与日志（那个数是有意义的）；想看参考图请显式用主窗
+        「▶ 按此种子重新对齐」，或「⋯ 更多→手动纠错→手动选点重合」（3 点标定）。
         """
         self._set_overlay_visible(False)
         self._last_rgba = None  # 清掉：跟随「G 重开地图」不许把上一张被否掉的投影放回来
@@ -1186,25 +1260,81 @@ class MainWindow(QWidget):
     def _mark_wrong(self):
         """把上次截图复制到 eval/inbox/，供定期标注进 labels.csv。"""
         if self._last_shot_path is None or not self._last_shot_path.exists():
-            self.status.setText("没有可回收的截图"); return
+            self._set_status("没有可回收的截图"); return
         EVAL_INBOX.mkdir(parents=True, exist_ok=True)
         dst = EVAL_INBOX / self._last_shot_path.name
         try:
             import shutil
             shutil.copy2(self._last_shot_path, dst)
-            self.status.setText(f"已回收失败样本→ {dst.name}（待标注进 eval/labels.csv）")
+            self._set_status(f"已回收失败样本→ {dst.name}（待标注进 eval/labels.csv）")
         except Exception as e:  # noqa: BLE001
-            self.status.setText(f"回收失败: {e}")
+            self._set_status(f"回收失败: {e}")
 
-    # ---- 选项菜单（UI改造B2：低频折叠）----
+    # ---- 日志窗 / 参考图对话框（T2b：从主窗搬出去的常驻控件）----
+    def _show_log_window(self):
+        """运行日志窗。**关窗不销毁 `log_view`** ⇒ 关着的那段日志不会丢，再打开还在。"""
+        if self._log_window is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("运行日志")
+            dlg.resize(640, 340)
+            lay = QVBoxLayout(dlg); lay.setContentsMargins(6, 6, 6, 6)
+            lay.addWidget(self.log_view)      # 重挂父控件，但对象所有权仍在 MainWindow
+            row = QHBoxLayout()
+            btn_clear = QPushButton("清空"); btn_clear.clicked.connect(self.log_view.clear)
+            row.addWidget(btn_clear); row.addStretch(1)
+            lay.addLayout(row)
+            self._log_window = dlg
+        self._log_window.show(); self._log_window.raise_(); self._log_window.activateWindow()
+
+    def _show_ref_picker(self):
+        """「参考图」对话框：方向/门/楼层/入口 4 个下拉（T2b 从主窗搬进来）。
+
+        ⚠️ **combo 对象仍归 MainWindow，只是换了父布局容器** —— `currentIndexChanged` 上挂的
+        `_on_direction_changed` / `_resolve_seed` 一个都没断，`_realign` 读的仍是本体
+        (`self.direction_combo.currentText()`)。对话框只负责显示，关掉不销毁 combo，
+        所以下次再点开还是同一批对象、连接照旧。（这是本次改造最容易回归的点。）
+        """
+        if self._ref_dialog is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("参考图（手动纠错用）")
+            lay = QVBoxLayout(dlg); lay.setContentsMargins(8, 8, 8, 8)
+            for text, widget in [("方向（入口朝向）", self.direction_combo),
+                                 ("门特征", self.door_combo),
+                                 ("楼层", self.floor_combo),
+                                 ("入口(引索匹配用)", self.entrance_combo)]:
+                lay.addWidget(QLabel(text)); lay.addWidget(widget)
+            tip = QLabel("提示：选完关掉本窗，主窗「▶ 按此种子重新对齐」即用这个种子。")
+            tip.setStyleSheet("color:#888; font-size:11px;"); tip.setWordWrap(True)
+            lay.addWidget(tip)
+            row = QHBoxLayout()
+            btn_ok = QPushButton("确定"); btn_ok.clicked.connect(dlg.accept)
+            row.addWidget(btn_ok); row.addStretch(1)
+            lay.addLayout(row)
+            dlg.resize(300, 260)
+            self._ref_dialog = dlg
+        self._ref_dialog.show(); self._ref_dialog.raise_(); self._ref_dialog.activateWindow()
+
+    def _swap_seed(self):
+        """「🔄 换种子」——行为归 T3（入口层 top3 顺位 + 会话内黑名单），此处先留位。"""
+        self._log_step("换种子：尚未实现（T3：入口层 top3 顺位重跑对齐 + 会话内黑名单）", "WARN")
+
+    # ---- 选项菜单（UI改造B2：低频折叠；T2b 收成三组）----
     def _show_options_menu(self):
         from PySide6.QtGui import QCursor
         from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
-        menu.addAction("🗂 素材管理", self._manage_materials)
-        menu.addAction("✗ 标记上次错→回收", self._mark_wrong)
-        menu.addAction("⚙ 设置", self._open_settings)
-        menu.addAction("ℹ 热键状态", self._show_hotkey_status)
+        fix = menu.addMenu("🛠 手动纠错")
+        fix.addAction("✂ 手框样本匹配", self._manual_sample_pick)
+        fix.addAction("✋ 手动选点重合", self._three_point_calib)
+        fix.addAction("🎯 参考图（方向/门/楼层/入口）…", self._show_ref_picker)
+        diag = menu.addMenu("🧪 诊断")
+        diag.addAction("📜 运行日志", self._show_log_window)
+        diag.addAction("✗ 标记上次错→回收", self._mark_wrong)
+        diag.addAction("🗂 素材管理", self._manage_materials)
+        diag.addAction("⚙ 设置", self._open_settings)
+        diag.addAction("ℹ 热键状态", self._show_hotkey_status)
+        menu.addSeparator()
+        menu.addAction("✕ 退出", self._quit)
         menu.exec(QCursor.pos())
 
     def _show_hotkey_status(self):
@@ -1212,7 +1342,8 @@ class MainWindow(QWidget):
         reg = hk is not None and bool(getattr(hk, "_callbacks", {}))
         QMessageBox.information(self, "热键状态",
             f"当前热键: {self.settings.hotkey}\n注册状态: "
-            + ("已注册" if reg else "未注册（可能被占用，去设置改键）"))
+            + ("已注册" if reg else "未注册（可能被占用，去设置改键）")
+            + f"\n\n状态灯: ● {self._led_text}")
 
     # ---- 设置（阶段2）----
     def _open_settings(self):
@@ -1223,8 +1354,14 @@ class MainWindow(QWidget):
             self._apply_settings()
 
     def _apply_settings(self):
-        """应用当前 settings：透明度/日志/墙体 alpha 即时；热键重注册。"""
-        self.log_view.setVisible(self.settings.show_log)
+        """应用当前 settings：透明度/日志窗/墙体 alpha 即时；热键重注册。"""
+        # T2b：show_log 语义已改为「启动时是否打开日志窗」——运行中改设置就即时开/关。
+        # 注意不能再去 `log_view.setVisible(...)`：它现在是日志窗的子控件，直接隐藏它
+        # 只会让日志窗里空一块，窗口还杵在那儿。
+        if self.settings.show_log:
+            self._show_log_window()
+        elif self._log_window is not None:
+            self._log_window.hide()
         self.opacity_slider.setValue(int(self.settings.overlay_opacity * 100))
         self._set_opacity(self.opacity_slider.value())
         # wall_alpha 下次投影生效（map_to_overlay_rgba 读 self.settings.wall_alpha）
@@ -1258,6 +1395,9 @@ class MainWindow(QWidget):
             self.overlay.close()
         if self.preview is not None:
             self.preview.close()
+        for dlg in (self._log_window, self._ref_dialog):
+            if dlg is not None:
+                dlg.close()
         hk = getattr(self, "_hotkeys", None)
         if hk is not None:
             try:
@@ -1288,9 +1428,9 @@ def main():
                       + settings.hotkey, "INFO")
     except Exception as e:  # noqa: BLE001
         win.set_led(False, "热键失败")
-        win._log_step(f"热键注册失败: {e}（手动选门/3点标定仍可用）", "ERROR")
+        win._log_step(f"热键注册失败: {e}（{FIX_PATH}参考图 手动选门 / 3点标定仍可用）", "ERROR")
         QMessageBox.warning(win, "热键注册失败",
-            f"{e}\n\n手动选门 + 3 点标定仍可用。\n（可在「设置」改热键）")
+            f"{e}\n\n{FIX_PATH}参考图 手动选门 + 3 点标定仍可用。\n（可在「设置」改热键）")
     win._hotkeys = hotkeys  # 保引用
 
     sys.exit(app.exec())

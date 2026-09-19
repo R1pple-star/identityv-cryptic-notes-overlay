@@ -27,7 +27,7 @@ class Settings:
     overlay_opacity: float = 0.7      # 悬浮窗整体透明度 0.2-1.0
     wall_alpha: int = 160             # 地图墙体 alpha（map_to_overlay_rgba 原硬编码 160）
     hotkey: str = "Ctrl+Shift+F"      # 热键串，启动时 parse 成 (vk, mods)
-    show_log: bool = True             # 运行日志区显隐
+    show_log: bool = False            # 「启动时自动打开运行日志窗」（T2b 前是"运行日志区显隐"）
     sample_half_frac: float = 0.18    # 入口样本裁剪半边比例（icon 贴边时内部自动增大到 0.25）
     auto_follow: bool = True          # 自动跟随·第一步：G 开关游戏地图时投影同步显隐
     sample_preview_sec: float = 5.0   # 入口样本预览窗自动消失秒数（0 = 不自动消失）
@@ -81,7 +81,7 @@ class SettingsDialog(QDialog):
         self.hk_edit = QLineEdit(settings.hotkey)
         self.hk_edit.setPlaceholderText("如 Ctrl+Shift+F / Ctrl+Alt+G / F8")
 
-        self.log_chk = QCheckBox("显示运行日志区")
+        self.log_chk = QCheckBox("启动时自动打开运行日志窗")
         self.log_chk.setChecked(settings.show_log)
 
         self.follow_chk = QCheckBox("自动跟随地图开合（G 开关小地图时投影同步显隐）")
