@@ -365,6 +365,19 @@
       候选表永不缩小 ⇒ 每次点击重复试同一个候选。冒烟里有专门造这个不一致的回归（"★"条）。
       验收：`smoke_app_offscreen` **46/46**（9 条 T3 断言）；`e48` 三帧逐值不变；其余回归
       与基线逐位一致。详情见 `跟随收口与UI改造计划.md` §5 T3。
+  12. ✅ **T4 换楼层 done（2026-09-19）**：主窗第三行加「🔀 换楼层→X」按钮（困难模式一楼⇄二楼
+      直切；噩梦 3 层+地下室仍是 ❌ 推迟项，到时改菜单即可，未预设）。点一下 = 切 floor_combo
+      + **同步 entrance_combo**（二楼只有 1 个入口=楼梯到达点，`ENTRANCE_FLOOR["二楼"]`，刚上楼
+      玩家正站在该图标处 ⇒ 锚点精确；不同步的话 `_two_stage_align` 拿正门/侧门锚点配二楼图，
+      白丢最强约束）+ 走既有 `_align_to`（截屏→滑条/尺子 hint→两段式→过闸投影→`_seed_track`，
+      **零新增匹配逻辑**，跟踪 ref_path/`_last_rgba` 自动带新楼层）。按钮文案在 `_resolve_seed`
+      里经 `_sync_floor_btn` 刷（楼层变化全路径的单一汇聚点）。回一楼锚点必错（楼梯口不是引索
+      入口）→ 过闸失败自动回退全搜；`_et_for_floor`：一楼=上次热键入口兜底「正门」，二楼=「二楼」。
+      **顺手纠错（T3 交互）**：`_swap_seed` 改用**当前楼层**而非候选自带的 fl —— 否则二楼上点
+      「换种子」会被拽回一楼对齐（一楼场景 et 逐字不变，纯纠错）。已知限制（正确行为，勿"修"）：
+      刚上二楼探明极少时可能拒答；换楼层要求游戏内地图开着（`_align_to` 当场截屏）。
+      验收：`smoke_app_offscreen` **54/54**（+8 条 T4）；`e48` 异常 0 三帧逐值一致、`eval_match`
+      21/24+拒答20/44+控制组4/11、`e26` 21/44=48% —— **全部与基线逐位一致**。
 - ✅ 重构收尾验收（进行中）：游戏内实测 10 局有记录（置信/兜底成功率、重合观感）后重构才算完成。
 
 ## 运行
@@ -378,7 +391,7 @@ python eval/verify_entrance_e2e.py  # 入口匹配+对齐端到端回归（主�
 python experiments/e33_follow_track.py    # **跟随·第二步回归**（投影跟地图平移/缩放，10/10）
 python experiments/e45_zoom_follow_replay.py # **缩放跟随回归**（滑条/图标尺子/无源三条路，3/3）
 python experiments/e48_track_tick_live.py # **★跟踪主体真代码回归**（非复刻；改跟随必跑）
-python experiments/smoke_app_offscreen.py # 离屏冒烟（主窗 UI/换种子/投影窗/跟踪接线，46/46）
+python experiments/smoke_app_offscreen.py # 离屏冒烟（主窗 UI/换种子/换楼层/投影窗/跟踪接线，54/54）
 python build_entrance_index.py [种子号 ...]  # 重建入口引索
 python build_ui_template.py <全屏实机截图 ...>  # 重建导航列模板 assets/ui_nav_column.png
 python calib_annotate.py <截图路径>  # 校准标注图

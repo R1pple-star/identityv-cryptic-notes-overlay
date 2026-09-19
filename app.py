@@ -37,7 +37,7 @@ from core.alignment import (
 )
 from core.entrance import (
     _crop_around_icon, sample_structure, build_entrance_transform, find_seed_by_entrance,
-    load_index, score_desc,
+    load_index, score_desc, ENTRANCE_FLOOR,
 )
 from core.map_library import MapLibrary
 from core.vision import (_find_icon, FOG_OPEN_MIN, NAV_NCC_MIN, detect_fog_panel, load_bgr,
@@ -331,8 +331,14 @@ class MainWindow(QWidget):
         self.btn_swap = QPushButton("🔄 换种子")
         self.btn_swap.setEnabled(False)   # 初始态；`_sync_swap_btn` 按入口层排名给可用性
         self.btn_hide = QPushButton("👁 隐藏地图")
+        self.btn_floor = QPushButton("🔀 换楼层→二楼")   # 文案由 _sync_floor_btn 按当前楼层刷
+        self.btn_floor.setToolTip(
+            "困难模式只有一楼/二楼：直接切到对面楼层并当场重新对齐投影\n"
+            "切到二楼时入口锚点自动用「二楼」（楼梯到达点，刚上楼正站在那）\n"
+            "回一楼时楼梯口不是引索入口、锚点不适用，会自动回退全搜")
         self.btn_options = QPushButton("⋯ 更多")
         self.btn_swap.clicked.connect(self._swap_seed)
+        self.btn_floor.clicked.connect(self._switch_floor)
         self.btn_hide.clicked.connect(self._hide_overlay)
         self.btn_options.clicked.connect(self._show_options_menu)
         # 「✕ 退出」不再需要控件：它已进「⋯ 更多」菜单，直接连 `self._quit`。
@@ -349,7 +355,9 @@ class MainWindow(QWidget):
         row_align.addWidget(self.btn_realign, 3); row_align.addWidget(self.btn_swap, 2)
         root.addLayout(row_align)
         row_misc = QHBoxLayout(); row_misc.setSpacing(5)
-        row_misc.addWidget(self.btn_hide, 1); row_misc.addWidget(self.btn_options, 1)
+        row_misc.addWidget(self.btn_hide, 1)
+        row_misc.addWidget(self.btn_floor, 1.2)   # 文案最长（换楼层→X），多给一点
+        row_misc.addWidget(self.btn_options, 0.8)
         root.addLayout(row_misc)
         root.addWidget(self.seed_label)
         # 状态行：**一行**，日志窗默认关着时它是主窗唯一的运行反馈 ⇒ 截断（按像素）+
@@ -414,6 +422,9 @@ class MainWindow(QWidget):
         else:
             self.seed_label.setText(f"参考图: {direction}-{door} {floor} → 种子{self._seed} ▾")
             self.seed_label.setStyleSheet("color:#88dd88; font-size:11px;")
+        # 楼层变化的所有路径（floor_combo 信号 / _select_ref / _after_match / _swap_seed）
+        # 都汇到这里 ⇒ 「换楼层」按钮文案跟着当前楼层刷，只此一处。
+        self._sync_floor_btn()
 
     def _current_map(self):
         if not getattr(self, "_seed", None):
@@ -453,6 +464,48 @@ class MainWindow(QWidget):
         else:
             tip = "没有别的候选了 —— 按热键重新匹配（会自动清空排除名单）"
         self.btn_swap.setToolTip(tip)
+
+    def _sync_floor_btn(self):
+        """「🔀 换楼层」文案/可用性（T4）：指向当前楼层的**对面**（困难模式一楼⇄二楼直切）。
+
+        噩梦模式（3 层+地下室）仍是明确推迟项 —— 到时这里改成一圈轮换/菜单即可，
+        现在不预设。目标楼层没有参考图（素材缺失）也置灰，虽然 28 种子两层齐。
+        """
+        cur = self.floor_combo.currentText()
+        tgt = "一楼" if cur == "二楼" else "二楼"
+        ok = self._seed is not None and self.lib.get(self._seed, tgt) is not None
+        self.btn_floor.setEnabled(ok)
+        self.btn_floor.setText(f"🔀 换楼层→{tgt}")
+
+    def _switch_floor(self):
+        """「🔀 换楼层」（T4）：切到对面楼层并当场重对齐投影。
+
+        不新增任何匹配逻辑 —— 走 `_align_to`（截屏→滑条/尺子 hint→两段式对齐→过闸投影
+        →`_seed_track`）那条路，跟踪器 ref_path 与 `_last_rgba` 自动带上新楼层。
+        **入口下拉必须一起切**：二楼只有 1 个入口（楼梯到达点，`ENTRANCE_FLOOR["二楼"]`），
+        刚上楼玩家正站在该图标处 ⇒ 锚点（`index.json["二楼"]` 的 cx/cy ↔ 屏幕图标）精确；
+        不切的话 `_two_stage_align` 拿着"正门/侧门"锚点配二楼参考图，白白丢掉最强约束。
+        回一楼同理（锚点不适用 → 过不了闸 → 回退全搜，见技术备忘⑪"不会更差"）。
+        """
+        if self._seed is None:
+            self._set_status("请先选好方向+门"); return
+        cur = self.floor_combo.currentText()
+        tgt = "一楼" if cur == "二楼" else "二楼"
+        info = self.lib.get(self._seed, tgt)
+        if info is None:
+            self._set_status(f"引索里没有 种子{self._seed} 的 {tgt} 参考图"); return
+        et = self._et_for_floor(tgt)          # 先算：一楼档要读还没被切走的 entrance_combo
+        self._select_ref(info.key, tgt)       # 楼层下拉 + 参考图摘要行一起带走
+        self.entrance_combo.setCurrentText(et)   # 无信号连接（热键路径只现读），直接设
+        self._log_step(f"换楼层: {cur}→{tgt}（入口锚点={et}，种子{self._seed}）", "INFO")
+        self._align_to(self._seed, tgt, et, "换楼层")
+
+    def _et_for_floor(self, floor: str) -> str:
+        """该楼层对齐该用的入口类型：二楼=「二楼」（唯一入口）；一楼=上次热键的入口，兜底正门。"""
+        if floor == "二楼":
+            return "二楼"
+        et = self._entrance_et or self.entrance_combo.currentText()
+        return et if ENTRANCE_FLOOR.get(et) == "一楼" else "正门"
 
     # ---- 状态灯 / 运行日志（阶段1）----
     def set_led(self, ok: bool, text: str):
@@ -812,13 +865,17 @@ class MainWindow(QWidget):
             self._log_step(f"换种子: 候选耗尽 top{len(res)}={[int(r[1]) for r in res]} "
                            f"已排除={sorted(self._seed_bl)}", "WARN")
             return
-        sc, seed, key, fl, _s, _mloc = cand[0]
+        sc, seed, key, _fl, _s, _mloc = cand[0]
         self._tried_seed = int(seed)
+        # ⚠️ 停在**当前楼层**（T4）：候选自带的 fl 是「入口匹配那一层」——用户已用「换楼层」
+        # 切到二楼后再点换种子，若用候选的 fl 会被拽回一楼对齐（人明明在二楼）。
+        # 种子号与楼层无关（28 种子两层齐），楼层只挑参考图文件。
+        fl = self.floor_combo.currentText()
         self._log_step(f"换种子: 种子{bl_target}→种子{seed}（{key}[{fl}]，入口分{sc:.2f}，"
                        f"已排除={sorted(self._seed_bl)}）", "INFO")
         self._select_ref(key, fl)          # 摘要行 + 下拉一起带走，否则界面还显示被换掉的种子
         self._sync_swap_btn()
-        self._align_to(seed, fl, self._entrance_et or self.entrance_combo.currentText(), "换种子")
+        self._align_to(seed, fl, self._et_for_floor(fl), "换种子")
 
 
     def _three_point_calib(self):
