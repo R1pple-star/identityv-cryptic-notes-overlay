@@ -245,6 +245,18 @@ class MainWindow(QWidget):
         self.settings = settings if settings is not None else load_settings()
         self._shot = None           # 最近捕获的屏幕 BGR
         self._seed = None           # 当前选定种子（方向+门解析）
+        # T3「换种子」的状态：入口层排名 + 本次会话的黑名单。
+        # `_entrance_res` 是 `find_seed_by_entrance` 原样返回的排名 [(分,种子,key,楼层,s,mloc)...]；
+        # `_entrance_et` 是产出它的入口类型（换种子后重跑对齐要用同一个入口取图标锚点）。
+        self._entrance_res = None
+        self._entrance_et = None
+        self._seed_bl: set[int] = set()   # 只在「换种子」会话内累计；按热键清空（见 _entrance_pipeline_impl）
+        # **实际试过的那个种子**（不是 `self._seed` —— 那是从下拉反解出来的）。
+        # 换种子必须按这个拉黑：万一 `key→种子` 的反解与入口层排名里的种子对不上
+        # （合成候选测试里就撞上过：key「北-1门」反解成种子10，而候选里是种子1），
+        # 读 `self._seed` 会拉黑一个**不在候选表里**的号 ⇒ 候选表永不缩小 ⇒
+        # 每次点击都重复试同一个候选、永远换不完。冒烟里有这条回归。
+        self._tried_seed = None
         self.overlay: MapOverlay | None = None
         self.preview: SamplePreview | None = None  # 入口样本预览窗（阶段3）
         self._last_shot_path = None  # 最近截图保存路径（log/回收用）
@@ -317,8 +329,7 @@ class MainWindow(QWidget):
         self.btn_realign.setToolTip("当场截屏，用上面「参考图」选的那个种子重跑两段式对齐（=热键的同一条路）")
         self.btn_realign.clicked.connect(self._realign)
         self.btn_swap = QPushButton("🔄 换种子")
-        self.btn_swap.setEnabled(False)   # T3 才接行为；先占位（见计划 §5 T3）
-        self.btn_swap.setToolTip("入口层选错种子时换下一个候选（未实现，暂不可用）")
+        self.btn_swap.setEnabled(False)   # 初始态；`_sync_swap_btn` 按入口层排名给可用性
         self.btn_hide = QPushButton("👁 隐藏地图")
         self.btn_options = QPushButton("⋯ 更多")
         self.btn_swap.clicked.connect(self._swap_seed)
@@ -359,6 +370,7 @@ class MainWindow(QWidget):
         root.addLayout(row_op)
         self.setLayout(root)
         self.move(8, 60)
+        self._sync_swap_btn()        # 初始禁用 + 说明"还没匹配过"
         self._on_direction_changed()
         if self.settings.auto_follow:
             self._start_follow()
@@ -407,6 +419,40 @@ class MainWindow(QWidget):
         if not getattr(self, "_seed", None):
             return None
         return self.lib.get(self._seed, self.floor_combo.currentText())
+
+    def _select_ref(self, key: str, floor: str):
+        """把「参考图」那套下拉切到 `key`（形如 `北-1沙发门`）+ `floor`，并刷新摘要行。
+
+        热键命中（`_after_match`）与「🔄 换种子」共用 —— 两处都必须把主窗那行摘要
+        一起带走，否则界面上还显示着被换掉/被覆盖的那个种子。
+        """
+        self.floor_combo.blockSignals(True)
+        self.floor_combo.setCurrentText(floor)
+        self.floor_combo.blockSignals(False)
+        bdir, door = key.split("-", 1)
+        self.direction_combo.setCurrentText(bdir)
+        doors = [self.door_combo.itemText(i) for i in range(self.door_combo.count())]
+        if door in doors:
+            self.door_combo.setCurrentText(door)
+        self._resolve_seed()   # 上面若因值相同没触发信号，这里兜一次底
+
+    def _sync_swap_btn(self):
+        """「🔄 换种子」可用性（T3）。
+
+        有入口层排名就有候选可换 —— **包括投影被 `_refuse` 掉的时候**（种子已知、只是
+        没过闸），那恰恰是最需要换种子的场合。候选被拉黑光了就置灰，等下次热键清空。
+        """
+        res = self._entrance_res or []
+        left = [r for r in res if int(r[1]) not in self._seed_bl]
+        self.btn_swap.setEnabled(bool(left))
+        if not res:
+            tip = "还没匹配过 —— 先按热键（或「🔴 一键匹配」）拿到入口层候选"
+        elif left:
+            tip = (f"入口层候选还剩 {len(left)}/{len(res)}（已排除 {sorted(self._seed_bl) or '无'}）\n"
+                   "点一下 = 把当前种子拉黑 + 试下一个候选")
+        else:
+            tip = "没有别的候选了 —— 按热键重新匹配（会自动清空排除名单）"
+        self.btn_swap.setToolTip(tip)
 
     # ---- 状态灯 / 运行日志（阶段1）----
     def set_led(self, ok: bool, text: str):
@@ -481,6 +527,10 @@ class MainWindow(QWidget):
             self._log_step(tb, "ERROR")
 
     def _entrance_pipeline_impl(self):
+        # T3：按热键（=「🔴 一键匹配」）就是"重新自动来一次" ⇒ 清空换种子黑名单。
+        # 用户原话：「按"自动匹配"时就把黑名单重置防止匹配不到种子」—— 不清的话按着按着
+        # 候选就被自己拉黑光了，反而匹配不到。
+        self._seed_bl.clear()
         if not self._capture():
             return
         self._log_step("截屏 OK")
@@ -572,6 +622,12 @@ class MainWindow(QWidget):
         dom_frac: 匹配样本的单类占比（>DOMINANT_NOTE_MIN 且对齐失败时，居中兜底附
         「均匀区无锚点」说明——种子ID可信但面板没有可对齐的结构，非对齐算法失灵。"""
         sc, seed, key, fl, _s, _mloc = best
+        # T3：把入口层排名与产出它的入口类型存下来 —— 「🔄 换种子」靠它取下一个候选。
+        # 必须在**所有**早退分支之前存：退化/哨兵分那两类虽然没投影，但用户正需要换种子。
+        self._entrance_res = res
+        self._entrance_et = et
+        self._tried_seed = int(seed)
+        self._sync_swap_btn()
         corr_note = ("（面板为大段均匀区，无锚点可对齐——种子ID可信，地图居中仅供参考；"
                      "精确重合请3点标定）" if (dom_frac is not None and dom_frac > DOMINANT_NOTE_MIN) else "")
         # 退化防御：top1 与 top2 分差<0.001（多种子同分0.000）→ 样本无判别结构/图标假阳，不假阳报告
@@ -584,13 +640,7 @@ class MainWindow(QWidget):
             self._log_step("匹配无有效尺度（样本过大/引索缺）→ 框小一点(入口局部结构)或3点标定", "WARN")
             self._log(et, res, icon_pos, isc, None, corrected=corrected)
             return
-        self.floor_combo.blockSignals(True); self.floor_combo.setCurrentText(fl)
-        self.floor_combo.blockSignals(False)
-        bdir, door = key.split("-", 1)
-        self.direction_combo.setCurrentText(bdir)
-        doors = [self.door_combo.itemText(i) for i in range(self.door_combo.count())]
-        if door in doors:
-            self.door_combo.setCurrentText(door)
+        self._select_ref(key, fl)
 
         align = self._two_stage_align(shot, best, et, icon_pos)
         ov = asc = None
@@ -673,10 +723,14 @@ class MainWindow(QWidget):
             s_ui = s_k
         return s_ui, icon_pos
 
-    def _realign(self):
-        """用当前选定的方向+门+楼层重新对齐（**当场截屏** + 与热键同源的两段式）。
+    def _align_to(self, seed, floor: str, et: str, label: str) -> bool:
+        """**当场截屏** → 用指定种子走两段式对齐 → 过闸投影。返回是否投影成功。
 
-        2026-09-19 修两处（用户报「点『按此种子对齐』按钮对齐也是不准的」）：
+        `_realign`（用户手选种子）与 `_swap_seed`（换种子候选）共用这一条路 ——
+        保证「按此种子重新对齐」和「换种子」用的是**同一个对齐方式**（T1.5 的教训：
+        用户原话「把匹配时的对齐方式用在其他跟随和对齐的时候」）。
+
+        2026-09-19 修的两处（用户报「点『按此种子对齐』按钮对齐也是不准的」）都在这条路上：
 
         ① **必须当场重新截屏**。旧写法 `if self._shot is None and not self._capture()`
            只在从未截过屏时抓一张 ⇒ 按钮对齐的其实是**上一次热键那张旧图**，投影于是落在
@@ -685,43 +739,87 @@ class MainWindow(QWidget):
            15:42:43/54/57/59），**分数与重叠一字不差** —— 中间地图已挪过好几处，只有
            「同一张旧图 + 同一个变换」才会给出逐位相同的结果。
 
-        ② **把热键路径的对齐方式搬过来**（用户 2026-09-19 提的正是这句）。旧写法是无锚点
-           无尺度提示的全搜，而全搜在**这一帧**上就给出骗人的答案：实测
-           `captures/hotkey_20260919_154124.png` 全搜得 s≈0.39 / 分0.038 / 重叠1.00
-           （**过闸**），真值是 s≈0.83（图标尺子 0.374/k，k=0.45）—— 技术备忘① 的
-           「缩模板骗分」在尺度轴上重演：模板缩小 ⇒ 不一致像素被一起缩掉 ⇒ 分更低。
-           热键路径靠 `hint_s`（入口匹配尺度）+ `hint_icon`（图标钉死平移）双重约束才稳，
-           这里同样给（见 `_realign_hints`）。两者缺失只是退化成「少一层约束」；都不过对齐
-           显示闸就**回退全搜**，等于旧行为，不会更差。
+        ② **把热键路径的对齐方式搬过来**。旧写法是无锚点无尺度提示的全搜，而全搜在**这一帧**
+           上就给出骗人的答案：实测 `captures/hotkey_20260919_154124.png` 全搜得
+           s≈0.39 / 分0.038 / 重叠1.00（**过闸**），真值是 s≈0.83（图标尺子 0.374/k，k=0.45）
+           —— 技术备忘① 的「缩模板骗分」在尺度轴上重演：模板缩小 ⇒ 不一致像素被一起缩掉
+           ⇒ 分更低。热键路径靠 `hint_s`（入口匹配尺度）+ `hint_icon`（图标钉死平移）双重
+           约束才稳，这里同样给（见 `_realign_hints`）。两者缺失只是退化成「少一层约束」；
+           都不过对齐显示闸就**回退全搜**，等于旧行为，不会更差。
         """
-        info = self._current_map()
+        info = self.lib.get(seed, floor)
         if info is None:
-            self._set_status("请先选好方向+门"); return
+            self._set_status(f"引索里没有 种子{seed} 的 {floor} 参考图"); return False
         if not self._capture():
-            return
+            return False
         shot = self._shot
         panel = detect_fog_panel(shot)
         if panel is None:
-            self._set_status("屏幕分辨率未适配（非16:9且未校准）"); return
+            self._set_status("屏幕分辨率未适配（非16:9且未校准）"); return False
         # 复用热键路径的 `_two_stage_align`（hint 精修 → 过闸即用 → 回退全搜），零重复。
         # `best` 是入口层结果的元组 (score, seed, key, floor, s, mloc)：这里没有入口层匹配
-        # （种子是用户手选的），就把**滑条/尺子量出来的尺度**放进 `s` 槽 —— 它在这一段的
+        # （种子是手选/换来的），就把**滑条/尺子量出来的尺度**放进 `s` 槽 —— 它在这一段的
         # 唯一用途就是当 `hint_s`（见 build_entrance_transform），语义正好对得上。
         hint_s, icon_pos = self._realign_hints(shot, panel)
-        best = (0.0, self._seed, info.key, info.floor, hint_s, None)
-        align = self._two_stage_align(shot, best, self.entrance_combo.currentText(), icon_pos)
+        best = (0.0, seed, info.key, info.floor, hint_s, None)
+        align = self._two_stage_align(shot, best, et, icon_pos)
         if align is None:
-            self._set_status("对齐失败：探明不足"); return
+            self._set_status("对齐失败：探明不足"); return False
         M, asc, ov = align
         if asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN:
-            rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(), wall_alpha=self.settings.wall_alpha)
+            rgba = map_to_overlay_rgba(str(info.path), M, *self._screen_size(),
+                                       wall_alpha=self.settings.wall_alpha)
             self._show_overlay(rgba)
-            self._seed_track(self._shot, self._seed, info.floor, info.path, M)
+            self._seed_track(shot, seed, info.floor, info.path, M)
             self._set_status(f"已对齐(匹配{asc:.2f} 重叠{ov:.2f})：{info.key}")
-            self._log_step(f"手动重对齐: {info.key} 重合{asc:.2f} 重叠{ov:.2f} 已投影", "OK")
-        else:
-            self._refuse(info.key, f"手动重对齐没过闸(重合{asc:.2f} 重叠{ov:.2f})")
-            self._set_status(f"未投影：对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})｜{info.key}")
+            self._log_step(f"{label}: {info.key} 重合{asc:.2f} 重叠{ov:.2f} 已投影", "OK")
+            return True
+        self._refuse(info.key, f"{label}没过闸(重合{asc:.2f} 重叠{ov:.2f})")
+        self._set_status(f"未投影：对齐不可靠(匹配{asc:.2f} 重叠{ov:.2f})｜{info.key}")
+        return False
+
+    def _realign(self):
+        """「▶ 按此种子重新对齐」：用**主窗「参考图」行选的那个种子**重跑对齐。"""
+        info = self._current_map()
+        if info is None:
+            self._set_status("请先选好方向+门"); return
+        self._align_to(self._seed, info.floor, self.entrance_combo.currentText(), "手动重对齐")
+
+    def _swap_seed(self):
+        """「🔄 换种子」：把当前种子拉黑，用入口层排名里的下一个候选取代，重跑对齐。
+
+        **点一下 = 拉黑当前 + 试下一个**（用户 2026-09-19 定的触发模型）。点这个按钮的
+        理由本身就是"这个种子不对"，若改成"等对齐失败才拉黑"，用户得点两次才见效。
+
+        候选 = `find_seed_by_entrance` 的入口层排名（`self._entrance_res`，热键路径存下的）。
+        入口层 top-1 只有 ≈48%，已知稳定失败场景就是「北-1沙发门(23) 被判成 北-1门(10)」
+        —— 这时排名里通常紧跟着正确的那一个。
+
+        黑名单只在本会话内累计，**按热键清空**（见 `_entrance_pipeline_impl`）。
+        """
+        res = self._entrance_res or []
+        if not res:
+            self._set_status("还没有入口层排名 —— 先按热键匹配一次"); return
+        # 拉黑「上一次实际试过的种子」，**不是** `self._seed`（下拉反解）—— 见 `_tried_seed` 的长注。
+        bl_target = self._tried_seed if self._tried_seed is not None else self._seed
+        if bl_target is not None:
+            self._seed_bl.add(int(bl_target))
+        cand = [r for r in res if int(r[1]) not in self._seed_bl]
+        if not cand:
+            self._sync_swap_btn()
+            self._set_status(f"没有别的候选了（入口 top{len(res)} 已被排除光）—— "
+                             "按热键重新匹配（会清空排除名单）")
+            self._log_step(f"换种子: 候选耗尽 top{len(res)}={[int(r[1]) for r in res]} "
+                           f"已排除={sorted(self._seed_bl)}", "WARN")
+            return
+        sc, seed, key, fl, _s, _mloc = cand[0]
+        self._tried_seed = int(seed)
+        self._log_step(f"换种子: 种子{bl_target}→种子{seed}（{key}[{fl}]，入口分{sc:.2f}，"
+                       f"已排除={sorted(self._seed_bl)}）", "INFO")
+        self._select_ref(key, fl)          # 摘要行 + 下拉一起带走，否则界面还显示被换掉的种子
+        self._sync_swap_btn()
+        self._align_to(seed, fl, self._entrance_et or self.entrance_combo.currentText(), "换种子")
+
 
     def _three_point_calib(self):
         """手动兜底：3 点标定（affine_from_points，3 下点击必对）。
@@ -1313,10 +1411,6 @@ class MainWindow(QWidget):
             dlg.resize(300, 260)
             self._ref_dialog = dlg
         self._ref_dialog.show(); self._ref_dialog.raise_(); self._ref_dialog.activateWindow()
-
-    def _swap_seed(self):
-        """「🔄 换种子」——行为归 T3（入口层 top3 顺位 + 会话内黑名单），此处先留位。"""
-        self._log_step("换种子：尚未实现（T3：入口层 top3 顺位重跑对齐 + 会话内黑名单）", "WARN")
 
     # ---- 选项菜单（UI改造B2：低频折叠；T2b 收成三组）----
     def _show_options_menu(self):
