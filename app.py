@@ -776,12 +776,16 @@ class MainWindow(QWidget):
         return True
 
     def _show_sample_preview(self, bgr):
-        """显示匹配用的入口样本（让玩家看到选对没），贴主窗右侧。"""
+        """显示匹配用的入口样本（让玩家看到选对没），贴主窗右侧。
+
+        自动消失秒数每次从 settings 现读（T2a）：预览窗弹完默认 5s 自己消失，防它一直
+        挂在屏幕上挡画面。0 = 不自动消失（旧行为）。
+        """
         if self.preview is None:
             self.preview = SamplePreview()
             g = self.geometry()
             self.preview.move(g.right() + 8, g.top())
-        self.preview.set_sample(bgr)
+        self.preview.set_sample(bgr, autohide_sec=self.settings.sample_preview_sec)
         self.preview.show()
 
     def _refuse(self, label, why):

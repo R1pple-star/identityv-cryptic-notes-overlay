@@ -30,6 +30,7 @@ class Settings:
     show_log: bool = True             # 运行日志区显隐
     sample_half_frac: float = 0.18    # 入口样本裁剪半边比例（icon 贴边时内部自动增大到 0.25）
     auto_follow: bool = True          # 自动跟随·第一步：G 开关游戏地图时投影同步显隐
+    sample_preview_sec: float = 5.0   # 入口样本预览窗自动消失秒数（0 = 不自动消失）
 
 
 def load() -> Settings:
@@ -39,7 +40,7 @@ def load() -> Settings:
         if SETTINGS_PATH.exists():
             d = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             for k in ("overlay_opacity", "wall_alpha", "hotkey", "show_log",
-                      "sample_half_frac", "auto_follow"):
+                      "sample_half_frac", "auto_follow", "sample_preview_sec"):
                 if k in d:
                     setattr(s, k, d[k])
     except Exception:  # noqa: BLE001
@@ -62,7 +63,7 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(360, 320)
+        self.resize(380, 400)
         self.result_settings: Settings | None = None
 
         self.op_slider = QSlider(Qt.Orientation.Horizontal); self.op_slider.setRange(20, 100)
@@ -90,6 +91,13 @@ class SettingsDialog(QDialog):
         self.sample_spin.setRange(0.05, 0.40); self.sample_spin.setSingleStep(0.01)
         self.sample_spin.setValue(settings.sample_half_frac)
 
+        self.preview_spin = QDoubleSpinBox()
+        self.preview_spin.setRange(0.0, 30.0); self.preview_spin.setSingleStep(1.0)
+        self.preview_spin.setDecimals(0); self.preview_spin.setSuffix(" 秒")
+        self.preview_spin.setValue(settings.sample_preview_sec)
+        self.preview_spin.setToolTip("样本预览窗弹出后多久自动消失。0 = 不自动消失（旧行为）。\n"
+                                     "鼠标还在预览窗上、或正在拖动它时会自动续期。")
+
         btn_ok = QPushButton("确定"); btn_ok.clicked.connect(self._ok)
         btn_cancel = QPushButton("取消"); btn_cancel.clicked.connect(self.reject)
 
@@ -101,6 +109,8 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.follow_chk)
         lay.addWidget(QLabel("入口样本裁剪比例（手框样本范围参考）"))
         lay.addWidget(self.sample_spin)
+        lay.addWidget(QLabel("样本预览窗自动消失（0 = 不消失）"))
+        lay.addWidget(self.preview_spin)
         row = QHBoxLayout(); row.addWidget(btn_ok); row.addWidget(btn_cancel); row.addStretch(1)
         lay.addLayout(row)
 
@@ -119,5 +129,6 @@ class SettingsDialog(QDialog):
             show_log=self.log_chk.isChecked(),
             sample_half_frac=float(self.sample_spin.value()),
             auto_follow=self.follow_chk.isChecked(),
+            sample_preview_sec=float(self.preview_spin.value()),
         )
         self.accept()

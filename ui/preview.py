@@ -4,6 +4,8 @@
 ==================
 独立普通窗口，显示「软件拿来匹配的入口样本」+ 图标位置框，让玩家看到匹配
 用的是哪块区域——选错了能立刻发现。贴主控制窗旁，可拖动。
+**默认 5 秒后自动消失**（`settings.sample_preview_sec`，0 = 不消失），防它一直
+挂在屏幕右上角挡画面；鼠标还在窗上或正在拖动时会续期（见 `_on_timeout`）。
 手框纠错见 app.py 的 ClickPicker(rect 模式) + _manual_sample_pick。
 """
 from __future__ import annotations
@@ -12,8 +14,8 @@ import ctypes
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QCursor, QImage, QPixmap
 from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 # 从截屏画面排除（同 ui/overlay 的投影窗）。**预览窗必须也排除**：它是可拖动的普通窗口，
@@ -53,12 +55,42 @@ class SamplePreview(QWidget):
         self._btn_close.setStyleSheet(
             "QPushButton{background:#333;color:#aaa;border:none;font-size:12px;}"
             "QPushButton:hover{background:#c0392b;color:#fff;}")
-        self._btn_close.clicked.connect(self.hide)
+        self._btn_close.clicked.connect(self._on_close_clicked)
         self._btn_close.raise_()
         self._drag = None
+        # 自动消失计时（T2a）。⚠️ 刻意**不用** enterEvent/leaveEvent 计时：窗里的
+        # QLabel/QPushButton 是子控件，Qt 按「光标下那个 widget」派发进出事件 —— 鼠标
+        # 一移到样本图上，父窗就会收到 leaveEvent，于是"用户正盯着看"反而成了恢复计时
+        # 的信号，5 秒后图就没了。改成到点那一刻再问一次光标在不在（`_on_timeout`）。
+        self._autohide_sec = 5.0
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._on_timeout)
 
-    def set_sample(self, bgr: np.ndarray | None, icon_box=None):
-        """bgr: HxWx3 BGR。icon_box: (x,y,w,h) 在 bgr 坐标，可选（画黄框）。"""
+    # ---- 自动消失 ----
+    def _mouse_inside(self) -> bool:
+        """光标是否还在本窗（含子控件）范围内。窗隐藏/光标在外都 False。"""
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
+    def _on_timeout(self):
+        if self._drag is not None or self._mouse_inside():
+            self._timer.start()  # 还在看 / 还在拖 → 再等一轮，别抢走
+            return
+        self.hide()              # 只隐藏不销毁：下次匹配 set_sample + show 直接复用
+
+    def _on_close_clicked(self):
+        self._timer.stop()
+        self.hide()
+
+    def set_sample(self, bgr: np.ndarray | None, icon_box=None, autohide_sec=None):
+        """bgr: HxWx3 BGR。icon_box: (x,y,w,h) 在 bgr 坐标，可选（画黄框）。
+
+        autohide_sec: 覆盖自动消失秒数（None = 沿用上次，初值 5.0）；0 = 不自动消失。
+        每次匹配都会重新计时 —— 调用方（app._show_sample_preview）传 settings 里的值。
+        """
+        if autohide_sec is not None:
+            self._autohide_sec = float(autohide_sec)
+        self._timer.stop()  # 重设样本 = 重新计时，别让上一张的倒计时把这张收走
         if bgr is None:
             self._label.setText("（无样本）"); self._label.setPixmap(QPixmap()); return
         h, w = bgr.shape[:2]
@@ -74,6 +106,8 @@ class SamplePreview(QWidget):
         qimg = QImage(small.tobytes(), dw, dh, 3 * dw,
                       QImage.Format.Format_RGB888).rgbSwapped()
         self._label.setPixmap(QPixmap.fromImage(qimg))
+        if self._autohide_sec > 0:  # 图备好了才开始倒计时（0 = 不自动消失 = 旧行为）
+            self._timer.start(int(self._autohide_sec * 1000))
 
     # ---- 无边框拖动 ----
     def mousePressEvent(self, e):
