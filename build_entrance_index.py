@@ -42,7 +42,19 @@ C_2F = (60, 120, 240)     # 二楼 蓝
 SCALES = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5, 1.8, 2.2, 2.6, 3.0)
 MIN_SCORE = 0.60
 PEAK_SUPPRESS = 30  # 峰值抑制半径(像素)
-CROP_K = 6.0       # 引索裁剪半边 = 图标检测尺寸 * CROP_K(够大含入口房间形状)
+# 引索裁剪半边 = 图标检测尺寸 * CROP_K。6.0（含入口房间形状）已不够：图标锚定
+# （core.entrance._ANCHOR_PIN）要求模板**完整落在锚点周围**，半幅需 ≥ 样本裁样的世界覆盖
+# （≈0.36×面板半幅×kf ≈ 83~116 参考px），6.0 只有 ~114px 且常被参考图边缘裁短
+# （实测 iwx 低到 166）→ 锚定档整张算不出种子（e5 A/B：标准窗 25 张里丢 6~8 张）。
+# 12.0 = 2×。放大窗口本身会让全搜变差（e5：主集 top-1 3/3→2/3、控制组低分确信 1→5），
+# 由锚定抵消（大窗+锚定回到 3/3 与 1）。
+CROP_K = 12.0
+# 细网格：0.20-1.00 步 0.02（r≈0.36 邻域要密），1.05-3.00 步 0.05（兜底到旧粗网格上界）。
+# 旧粗网格 SCALES 下界 0.4 会把真实 r 钉在边界（实测 82 个入口全部 0.4 = 饱和），而锚定要
+# s0 = r_fine/k，必须量准。
+SCALES_FINE = tuple(round(0.20 + 0.02 * i, 2) for i in range(41)) + \
+              tuple(round(1.05 + 0.05 * i, 2) for i in range(40))
+FINE_HALF = 90     # 重测邻域半边（参考px）
 
 
 def find_entrance_icons(ref_bgr, icon_gray,
@@ -90,8 +102,37 @@ def label_floor1(icons):
     return {"正门": by_y[-1], "侧门": by_y[0]}
 
 
+def measure_fine_scale(ref_bgr, icon_gray, cx, cy, half=FINE_HALF):
+    """在已定位的 (cx,cy) 邻域用细网格重测图标尺度，返回 (r_fine, ncc)。
+
+    位置已由 find_entrance_icons 定准（实测峰位偏移 ≤1px、NCC 0.78~0.92），故只重测尺度：
+    细网格 + 下探到 0.20，避开粗网格下界饱和。r_fine 供图标锚定的 s0 = r_fine/k。
+    """
+    H, W = ref_bgr.shape[:2]
+    x0, x1 = max(0, cx - half), min(W, cx + half)
+    y0, y1 = max(0, cy - half), min(H, cy + half)
+    win = cv2.cvtColor(ref_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    iw, ih = icon_gray.shape[1], icon_gray.shape[0]
+    best = (None, 0.0)
+    for r in SCALES_FINE:
+        siw, sih = max(8, int(round(iw * r))), max(8, int(round(ih * r)))
+        if siw > win.shape[1] or sih > win.shape[0]:
+            continue
+        ic = cv2.resize(icon_gray, (siw, sih), interpolation=cv2.INTER_AREA)
+        _, mv, _, _ = cv2.minMaxLoc(cv2.matchTemplate(win, ic, cv2.TM_CCOEFF_NORMED))
+        if mv > best[1]:
+            best = (r, float(mv))
+    return best
+
+
 def crop_around(ref_bgr, icon, half_k=CROP_K):
-    """以图标中心裁 K 倍图标尺寸的方框区域，返回 (crop_bgr, x0,y0,x1,y1)。"""
+    """以图标为中心裁 K 倍图标尺寸的方框区域，返回 (crop_bgr, x0,y0,x1,y1)。
+
+    **保持「居中 + 硬裁」**：贴参考图边缘的入口会裁成残片，但这正是锚定需要的——图标
+    必须尽量落在裁图中心，两侧各留出 ≥ 模板世界覆盖(≈84~116px) 的余量。试过「整体平移
+    塞进参考图」，结果图标被推到裁图边缘、锚定放不下 → 掉回大窗口全搜（=A/B 里会炸的
+    E 档），e2e 2/4→0/4、主集 3/3→2/3，已撤销。贴边入口是已知死角，见计划文档。
+    """
     sc, cx, cy, s, siw, sih = icon
     half = int(max(siw, sih) * half_k)
     H, W = ref_bgr.shape[:2]
@@ -141,8 +182,13 @@ def build_for_seed(lib, seed, out_dir, min_score=MIN_SCORE):
                 crop, bb = crop_around(ref, ic)
                 Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(
                     out_dir / f"{seed}_{name}.png")
+                r_fine, ncc = measure_fine_scale(ref, icon, ic[1], ic[2])
                 index[name] = {"floor": "一楼", "cx": int(ic[1]), "cy": int(ic[2]),
-                               "scale": float(ic[3]), "box": list(map(int, bb))}
+                               "scale": float(ic[3]),
+                               "scale_fine": float(r_fine if r_fine else ic[3]),
+                               "box": list(map(int, bb))}
+                print(f"    {name} r_fine={index[name]['scale_fine']:.2f}(NCC{ncc:.2f}) "
+                      f"box边长{bb[2]-bb[0]}x{bb[3]-bb[1]}")
                 color = C_MAIN if name == "正门" else C_SIDE
                 boxes.append((name, *bb, color))
             draw_boxes(ref, boxes).save(out_dir / f"{seed}_一楼标注.png")
@@ -156,7 +202,10 @@ def build_for_seed(lib, seed, out_dir, min_score=MIN_SCORE):
             Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(
                 out_dir / f"{seed}_二楼.png")
             index["二楼"] = {"floor": "二楼", "cx": int(ic[1]), "cy": int(ic[2]),
-                             "scale": float(ic[3]), "box": list(map(int, bb))}
+                             "scale": float(ic[3]),
+                             "scale_fine": float(measure_fine_scale(ref, icon, ic[1], ic[2])[0]
+                                                 or ic[3]),
+                             "box": list(map(int, bb))}
             draw_boxes(ref, [("二楼", *bb, C_2F)]).save(out_dir / f"{seed}_二楼标注.png")
     import json
     (out_dir / f"{seed}_index.json").write_text(
