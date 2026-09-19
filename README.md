@@ -34,12 +34,9 @@
 pip install -r requirements.txt
 ```
 
-1. **准备参考图库**（工具不自带答案图，需自备）：摸金模式 28 个种子 × 2 楼层的参考地图。本项目的地图素材来自博主 **凉哈皮** 的摸金地图，请自行获取后放入一个目录。
-   文件名格式：`{种子号} {方向}-{门特征}{楼层}.png`，如 `1 右-左上右下门一楼.png`（解析规则见 `core/map_library.py`）。
-2. **配置路径**：编辑 `config.toml` 的 `[paths]`：
-   - `map_library` = 你的参考图库目录
-   - `shot_library` = 游戏截图存放目录（测试样本，可选）
-3. **重建入口引索**（若你的参考图与仓库内置的不同）：
+1. **参考图库已随仓库附带**（`assets/maps/`，28 种子 × 2 楼层，素材来自博主 **凉哈皮**，版权归其所有，见文末说明），无需另外获取。文件名格式 `{种子号} {方向}-{门特征}{楼层}.png`（解析规则见 `core/map_library.py`）。
+2. （可选）`config.toml [paths].shot_library` 指向你的游戏截图目录 —— 仅回归测试用，日常使用不需要。
+3. **重建入口引索**（若你替换/更新了 `assets/maps/` 里的参考图）：
    ```bash
    python build_entrance_index.py
    ```
@@ -84,7 +81,7 @@ app.py                  主程序（悬浮窗 UI + 热键分发）
 core/                   匹配与对齐核心（vision / entrance / alignment / map_library）
 ui/                     界面与系统层（capture / follow / track / overlay / hotkey / ...）
 eval/                   回归测试 + 真值标注（labels.csv）+ 已入库回归脚本
-assets/                 入口引索（entrance_index/）+ 图标/导航列模板
+assets/                 参考图库（maps/）+ 入口引索（entrance_index/）+ 图标/导航列模板
 experiments/            一次性诊断脚本（gitignore，仅本机）
 docs/                   计划文档
 build_entrance_index.py 入口引索构建工具
@@ -102,4 +99,4 @@ calib_annotate.py       校准标注图工具
 ## 素材来源与许可
 
 - **代码**：MIT License（见 [LICENSE](LICENSE)）。
-- **地图参考素材**：来自博主 **凉哈皮** 的摸金地图，版权归其本人及网易第五人格所有，本仓库内置的引索派生图（`assets/entrance_index/`）同理，仅供个人学习研究，请勿用于商业用途。
+- **地图参考素材**：来自博主 **凉哈皮** 的加页手记（摸金）地图，版权归其本人及网易第五人格所有；本仓库随附的参考图（`assets/maps/`）与引索派生图（`assets/entrance_index/`）仅供个人学习研究，请勿用于商业用途。

@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-入口引索匹配（新匹配模式）
-========================
+入口引索匹配
+============
 用户先选入口(正门/侧门/二楼)；游戏内捕获后，按检测到的入口白箭头图标裁出入口区域，
-与各种子的入口引索裁图(entrance_index/{seed}_{type}.png)严格对比：
-分类(迷雾剔除) + 多尺度 SQDIFF。排名种子。
+与各种子的入口引索裁图(entrance_index/{seed}_{type}.png)按**墙重合度量**对比（见下方
+长注），排名种子。
 
 原理：正门房间形状固定(不判别)，侧门/二楼房间形状各异(主要判别依据)。
 故侧门/二楼入口匹配能定种子；正门通常分不出(各种子相似)。
 
-§3.1：find_seed_by_entrance 除返回 (results, icon_pos, icon_score) 外，每条 result
+find_seed_by_entrance 除返回 (results, icon_pos, icon_score) 外，每条 result
 额外带 (匹配尺度 s, minMaxLoc 参考图匹配位置 mloc)，供两段式对齐第一段构造 M1。
 """
 from __future__ import annotations
@@ -32,39 +32,35 @@ with open(ROOT / "config.toml", "rb") as _f:
 ENTRANCE_INDEX_DIR = (ROOT / _CFG["paths"]["entrance_index"]).resolve()
 ENTRANCE_FLOOR = {"正门": "一楼", "侧门": "一楼", "二楼": "二楼"}
 # 入口裁图尺度接近(都~200px)，窄范围多尺度对齐。下限 0.35：游戏默认（不碰缩放）入口
-# 状态 s≈0.40（2026-09-14 实测 6 局图标 k=1.0，s=0.4/k），旧下限 0.6 会把默认态全部
+# 状态 s≈0.40（实测默认态图标 k=1.0，s=0.4/k），下限取 0.6 会把默认态全部
 # 撞底钉住 → 匹分失真/同分退化。上界不变（观测域）。
 SCALES_ENT = (0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4)
-# 最小模板世界覆盖闸：模板边长 < 此值直接跳过该尺度。旧下限 0.6 隐式兼任防小模板假
-# 获胜（小模板塞进均匀区 SQDIFF 偏低——17.13 实测种子16 在 s=0.55 以 112px 模板拿
-# 0.039 反超真种子 0.046）；扩域到 0.35 后必须显式补上。实测真匹配模板世界覆盖
-# 163-204 参考px（k∈[0.40,1.0] 经 ruler/基线裁样），150 = 下沿留 ~8% 余量。大裁样
-# （k 放大后 ~464px）在 0.35 档模板 162px 仍可搜，204px 基线裁样 0.735 以下全挡。
+# 最小模板世界覆盖闸：模板边长 < 此值直接跳过该尺度。防小模板假获胜——小模板塞进
+# 均匀区分值偏低（实测种子16 在 s=0.55 以 112px 模板拿 0.039 反超真种子 0.046）。
+# 真匹配模板世界覆盖实测 163-204 参考px（k∈[0.40,1.0] 裁样），150 = 下沿留 ~8% 余量。
+# 大裁样（k 放大后 ~464px）在 0.35 档模板 162px 仍可搜；204px 基线裁样 0.735 以下全挡。
 MIN_TEMPLATE_PX = 150
-# 图标当尺子·棘轮基准：k 高于此值才放大裁样（k≤此值保持基线 half=102px）。8 月全部
-# 基线数据 k∈[0.40,0.45]（细网格 NCC 峰）→ 棘轮保证其逐像素零扰动；默认档 k≈1.0 →
-# half≈232，世界覆盖回到 8 月水平（~184 参考px）。s 与裁框大小无关，扩大取样梯子救
-# 不了缩放——缩放只有这条 ruler 路径；只放大不缩小，缩小会让小模板假获胜（17.13 实测
-# 纯 ruler 缩到 186px → 错种子 0.031 反超）。
+# 图标当尺子·棘轮基准：k 高于此值才放大裁样（k≤此值保持基线 half=102px）。全部基线
+# 数据 k∈[0.40,0.45]（细网格 NCC 峰）→ 棘轮保证其逐像素零扰动；默认档 k≈1.0 →
+# half≈232，世界覆盖回到基线水平（~184 参考px）。s 与裁框大小无关，扩大取样梯子救
+# 不了缩放——缩放只有这条 ruler 路径；只放大不缩小，缩小会让小模板假获胜（实测纯
+# ruler 缩到 186px → 错种子 0.031 反超）。
 ICON_K_REF = float(_CFG["match"].get("icon_k_ref", 0.44))
 # 渐变迷雾剔除：迷雾是渐变色，tol24 精确色只剔得净雾核，渐变外圈会被判成通路
 # 污染掩膜 —— 故把雾核膨胀 _FOG_DILATE px 一并剔（渐变段与雾核空间相邻）。
 # 该掩膜现只用于**快速失败闸**（样本结构占比 < sample_mask_min 即拒答）与单类退化检测；
 # 入口排序本身走墙重合度量，不吃这张掩膜。
 _FOG_DILATE = int(_CFG["match"].get("fog_dilate", 5))
-# 图标锚定（2026-09-15 上线）：样本图标 ↔ 引索图标重合后**钉死平移只搜尺度**，尺度由
-# 「图标当尺子」定 s0 = r_fine/k（两侧对同一模板 assets/_icon_entrance.png 做 NCC；k 由
-# _find_icon 细网格量，r_fine 由引索侧细网格量、存 json 的 scale_fine）。依据
-# experiments/e5_anchor_ab.py 的 2×2 实测：引索窗口放大到 2× 后**全搜会炸**（主集 top-1
-# 3/3→2/3、控制组低分确信 1→5——搜索域变大=自相似错位有机可乘），锚定把它抹平回 3/3 与 1，
-# 且控制组真种子排名由 7~24 名提到 1~7 名。关掉（false）→ 该口径无锚点即全体弃权。
+# 图标锚定：样本图标 ↔ 引索图标重合后**钉死平移只搜尺度**。依据 A/B 实测：引索窗口
+# 放大到 2× 后**全搜会炸**（主集 top-1 3/3→2/3、控制组低分确信 1→5——搜索域变大
+# =自相似错位有机可乘），锚定把它抹平回 3/3 与 1，且控制组真种子排名由 7~24 名提到
+# 1~7 名。关掉（false）→ 该口径无锚点即全体弃权。
 _ANCHOR_PIN = bool(_CFG["match"].get("anchor_pin", False))
-# _ANCHOR_BAND/_ANCHOR_STEP/_ANCHOR_N（尺度窄带 s0±0.06）已废弃：s0=r_fine/k 的残差是 ~0.09
-# 量级，窄带兜不住（2026-09-16 实测把 17.11 真种子18 挤成种子15）。锚定现在只钉平移、
-# 尺度走全域 SCALES_ENT。config 的 [match].anchor_band 已删。
+# 锚定只钉平移、尺度走全域 SCALES_ENT（曾有 s0±0.06 尺度窄带，因 s0 残差 ~0.09 兜不住
+# 而废弃——窄带会把真种子挤出去）。
 #
-# 入口层口径：**墙重合度量**（唯一口径，见下方长注）。旧的「5 类错配率」class 档与
-# 「类号平方差」sqdiff 档已于 2026-09-16 连同 `_scan_seed` 一起删除 —— 回滚走 git。
+# 入口层口径：**墙重合度量**（唯一口径，见下方长注）。旧的「5 类错配率」与
+# 「类号平方差」档已删除，回滚走 git。
 
 
 def _crop_box(panel, icon_pos, half_frac=0.18, icon_k=None):
@@ -80,12 +76,12 @@ def _crop_box(panel, icon_pos, half_frac=0.18, icon_k=None):
     kf = max(1.0, (icon_k / ICON_K_REF)) if icon_k else 1.0
     # 上限 316=228/0.36/2：放大档(k≈1.0→真s≈0.36-0.40)下侧长 632×0.36=228 恰可搜，
     # 再大会把真尺度挤出可行域（710px 裁样实测全'-'）。同时保护梯子：0.25/0.32 档
-    # 在默认缩放下不至于全顶到同一个帽（284 帽实测压扁梯子 → 144715 丢失梯子救援）。
+    # 在默认缩放下不至于全顶到同一个帽（更小的帽实测会压扁梯子 → 梯子救援失效）。
     half_cap = 316
     half = min(int(min(pw, ph) * half_frac * kf), half_cap)
     edge = min(int(min(pw, ph) * 0.25 * kf), half_cap)
     if cxp < edge or cxp > pw - edge or cyp < edge or cyp > ph - edge:
-        half = edge  # 贴边 → 增大样本（17.13 中央不触发，基线不变）
+        half = edge  # 贴边 → 增大样本（图标居中时不触发，基线不变）
     side = 2 * half
     x0 = min(max(cxp - half, 0), max(0, pw - side))
     y0 = min(max(cyp - half, 0), max(0, ph - side))
@@ -99,10 +95,10 @@ def _crop_around_icon(shot, panel, icon_pos, half_frac=0.18, icon_k=None):
     房形信息缺失、单类退化；且 s 与裁框大小无关，扩大取样救不了缩放。故 k>K_REF 时
     half ∝ k/ICON_K_REF 放大裁样，把世界覆盖拉回基线水平。
     **只放大不缩小（棘轮）**：k≤K_REF 保持基线 half_frac 行为——缩小裁样会丢信息让
-    小模板假获胜（2026-09-14 实测 17.13 k=0.40 纯 ruler 缩到 186px → 错种子 0.031 反超），
-    且 8 月全部基线数据 k≤0.45，棘轮保证其逐像素零扰动。
+    小模板假获胜（实测 k=0.40 纯 ruler 缩到 186px → 错种子 0.031 反超），且全部基线
+    数据 k≤0.45，棘轮保证其逐像素零扰动。
     half 另设上限 min(pw,ph)//2：k 量偏大/贴边档放大时防止裁样超过 228/SCALES_ENT[0]
-    → 全尺度放不进引索 → 匹配恒空（同日实测 710px 裁样全'-'）。
+    → 全尺度放不进引索 → 匹配恒空（实测 710px 裁样全'-'）。
     icon 贴面板边缘时自动增大到 0.25 档（同乘 k 放大）。方框 clamp 入面板不截断。
     icon_k=None（手框样本等无图标尺度的场景）→ 保持旧行为不缩放。"""
     px, py, pw, ph = panel
@@ -118,9 +114,8 @@ def sample_structure(crop):
     通路(cls3) 污染 mask——故把雾核膨胀 _FOG_DILATE px 一并剔除（渐变段与雾核
     空间相邻）。参数见 config [match]。
 
-    返回 (cls, mask_u8)。**不再回传权重**：权重原本只喂入口层的 class 口径
-    （贴墙增益/房间加权），该口径 2026-09-16 已随 `_scan_seed` 一起删除；入口排序
-    现在走墙重合度量，只吃两侧的墙掩膜（classify_region(...)==5）。"""
+    返回 (cls, mask_u8)。**不回传权重**：入口排序走墙重合度量，只吃两侧的墙掩膜
+    （classify_region(...)==5）。"""
     cls_raw = classify_region(crop)
     cls = walls_as_floors(cls_raw, crop)
     fog = (np.abs(crop.astype(np.int16) - FOG_BGR).sum(axis=2) < FOG_TOL)
@@ -131,7 +126,7 @@ def sample_structure(crop):
     return cls, mask
 
 
-# ===== 墙重合度量（2026-09-16 用户提议，入口层**唯一**口径）=====
+# ===== 墙重合度量（入口层**唯一**口径）=====
 # 动机：5 类标签的"错配率"在大片均匀区（长走廊/大房间）没有判别力 —— 那里挪 40px 还是
 # "全一致"，正是入口样本最常见的形态；而"墙"是 1-9px 的细线，一挪就错开。
 # 做法（只比几何，不比色块）：
@@ -140,7 +135,7 @@ def sample_structure(crop):
 #   ③ 双向覆盖率：自己有多少比例的墙落在「对方墙膨胀 r 像素」带上，两个方向取平均
 #   ④ 容差 r 吸收厚度差（游戏内墙 5-9px vs 参考墙 1-3px），故不要求逐像素相等
 #   ⑤ 分 = 1 - 双向覆盖率（沿用"越小越匹配"，下游排序/闸门语义不变）
-# 实测（2026-09-16，6 张有真值的样本）：真种子**5/5 排第一**，领先次名 17%~58%；
+# 实测（6 张有真值样本）：真种子**5/5 排第一**，领先次名 17%~58%；
 # 位置敏感对照：引索墙平移 40px 后覆盖率 0.83→0.30 / 0.78→0.36 / 0.56→0.18。
 # 天然拒答：样本几乎没墙（未探明）时全部尺度跳过 ⇒ 该种子弃权 ⇒ 全体弃权则无结果，
 # 正好落在"刚进门信息缺失应拒答"上。
@@ -204,9 +199,8 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
     sample_crop: 手动框选的入口样本(HxWx3 BGR)，阶段3 手框纠错用；给了则用它做
     in_cls/in_mask(跳过 _crop_around_icon)，None 则自动以图标为中心裁。默认 None=基线。
     sample_origin: 手框样本左上角的**屏幕坐标**(x0,y0)。墙重合口径**必须**有它：
-    锚点=「样本图标 ↔ 引索图标」，而图标在样本内的偏移要靠样本原点算得。
-    2026-09-16 实机前该参数不存在 ⇒ 手框路径 icon_off 恒 None ⇒ 墙口径下每个种子都
-    弃权 ⇒ 手框**恒返回空**（日志里 9/9 次「手框样本仍无匹配」即此因，与框大小无关）。
+    锚点=「样本图标 ↔ 引索图标」，而图标在样本内的偏移要靠样本原点算得。缺它则
+    icon_off 恒 None ⇒ 墙口径下每个种子都弃权 ⇒ 手框路径恒返回空（与框大小无关）。
     """
     icon_pos, icon_score, icon_k = _find_icon(shot, *panel)
     if icon_pos is None and sample_crop is None:
@@ -251,8 +245,8 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
 
         # **必须锚定**：墙重合只在锚点处评一次。无锚点 = 该种子弃权，绝不回退全搜 ——
         # 全搜取的是每个尺度的全局最小、恒 ≤ 锚点那一点的值，于是"锚点用不了的种子"白拿
-        # 更宽的自由度，靠不公平优势压过真种子（17.11 实测：种子15 锚点 0/13 档可用，
-        # 回退全搜得 0.109，以 0.005 之差翻掉真种子18 的锚定值 0.114）。统计量不同就不可比；
+        # 更宽的自由度，靠不公平优势压过真种子（实测：某种子锚点 0/13 档可用，回退全搜
+        # 得 0.109，以 0.005 之差翻掉真种子的锚定值 0.114）。统计量不同就不可比；
         # 锚点不可用就不参与排名。这同时是治自相似「幽灵相位」的唯一无歧义约束。
         best_sc, best_s, best_mloc = (
             _scan_seed_wall(game_wall, ref_wall, SCALES_ENT, anchor, icon_off)
@@ -260,7 +254,7 @@ def find_seed_by_entrance(shot, lib, entrance_type: str,
         info = lib.get(seed, "一楼")
         if best_s is None:
             # 无任何尺度放得下（样本大于该种子引索裁图，如手框过大）：不计入。
-            # 旧版计入 1e9 哨兵分，多种子全 1e9 时排序无意义 → 假种子居中显示（2026-09-13 实测）。
+            # （若计入哨兵分，多种子同为哨兵时排序无意义 → 假种子居中显示。）
             continue
         results.append((best_sc, seed, info.key if info else str(seed), fl,
                         best_s, best_mloc))
@@ -289,8 +283,8 @@ def build_entrance_transform(best, entrance_type: str, index_json: dict,
 
     best: find_seed_by_entrance 的单条结果 (score, seed, key, fl, s, mloc)。
     对应关系：屏幕入口图标 icon_pos ↔ 参考图入口图标 (cx,cy)（来自 index_json）；
-    尺度：入口匹配尺度 s（各裁图均原生分辨率，s 与 find_overlay_transform 的 s 同义，
-    见 CLAUDE.md 两段式备忘）。M1 = [[1/s,0, ix-cx/s],[0,1/s, iy-cy/s]]。
+    尺度：入口匹配尺度 s（各裁图均原生分辨率，s 与 find_overlay_transform 的 s 同义）。
+    M1 = [[1/s,0, ix-cx/s],[0,1/s, iy-cy/s]]。
     返回 (M1(2x3), hint_s=s) 或 None（缺尺度/缺入口坐标）。
     """
     _sc, _seed, _key, _fl, s, _mloc = best

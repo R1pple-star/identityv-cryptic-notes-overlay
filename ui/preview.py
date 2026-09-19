@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-样本预览窗（阶段3）
+样本预览窗
 ==================
 独立普通窗口，显示「软件拿来匹配的入口样本」+ 图标位置框，让玩家看到匹配
 用的是哪块区域——选错了能立刻发现。贴主控制窗旁，可拖动。
@@ -58,7 +58,7 @@ class SamplePreview(QWidget):
         self._btn_close.clicked.connect(self._on_close_clicked)
         self._btn_close.raise_()
         self._drag = None
-        # 自动消失计时（T2a）。⚠️ 刻意**不用** enterEvent/leaveEvent 计时：窗里的
+        # 自动消失计时。⚠️ 刻意**不用** enterEvent/leaveEvent 计时：窗里的
         # QLabel/QPushButton 是子控件，Qt 按「光标下那个 widget」派发进出事件 —— 鼠标
         # 一移到样本图上，父窗就会收到 leaveEvent，于是"用户正盯着看"反而成了恢复计时
         # 的信号，5 秒后图就没了。改成到点那一刻再问一次光标在不在（`_on_timeout`）。
@@ -106,7 +106,7 @@ class SamplePreview(QWidget):
         qimg = QImage(small.tobytes(), dw, dh, 3 * dw,
                       QImage.Format.Format_RGB888).rgbSwapped()
         self._label.setPixmap(QPixmap.fromImage(qimg))
-        if self._autohide_sec > 0:  # 图备好了才开始倒计时（0 = 不自动消失 = 旧行为）
+        if self._autohide_sec > 0:  # 图备好了才开始倒计时（0 = 不自动消失）
             self._timer.start(int(self._autohide_sec * 1000))
 
     # ---- 无边框拖动 ----

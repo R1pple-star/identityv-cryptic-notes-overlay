@@ -4,7 +4,7 @@
 ================================
 软件内调整：悬浮窗透明度、地图墙体透明度、热键、日志显隐、样本裁剪尺寸。
 与 config.toml（算法常量，eval 读它）分离——本文件只管用户偏好，
-不影响匹配/对齐算法。不放匹配/对齐阈值（守 CLAUDE.md 阈值稳定精神）。
+不影响匹配/对齐算法。不放匹配/对齐阈值（算法阈值只放 config.toml，保持稳定）。
 """
 from __future__ import annotations
 
@@ -25,9 +25,9 @@ SETTINGS_PATH = ROOT / "settings.json"
 @dataclass
 class Settings:
     overlay_opacity: float = 0.7      # 悬浮窗整体透明度 0.2-1.0
-    wall_alpha: int = 160             # 地图墙体 alpha（map_to_overlay_rgba 原硬编码 160）
+    wall_alpha: int = 160             # 地图墙体 alpha
     hotkey: str = "Ctrl+Shift+F"      # 热键串，启动时 parse 成 (vk, mods)
-    show_log: bool = False            # 「启动时自动打开运行日志窗」（T2b 前是"运行日志区显隐"）
+    show_log: bool = False            # 「启动时自动打开运行日志窗」
     sample_half_frac: float = 0.18    # 入口样本裁剪半边比例（icon 贴边时内部自动增大到 0.25）
     auto_follow: bool = True          # 自动跟随·第一步：G 开关游戏地图时投影同步显隐
     sample_preview_sec: float = 5.0   # 入口样本预览窗自动消失秒数（0 = 不自动消失）

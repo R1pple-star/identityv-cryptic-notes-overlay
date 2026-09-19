@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-对齐引擎（从 find_seed_submap.py + matcher.py 抽出，Phase 2.2）
+对齐引擎
 =====================================================
 投影重合核心：用迷雾剔除后的探明模板，对参考图(内容裁剪)做掩膜匹配，
 取最佳 (尺度,位置) 构造相似变换 M(北朝上、仅缩放+平移)，warp 整张参考图到屏幕。
 以及手动标定(affine_from_points) / 点变换(transform_point) / RGBA 悬浮层生成。
-
-搬家自 find_seed_submap.py（find_overlay_transform 及附属）与 matcher.py
-（affine_from_points/transform_point/map_to_overlay_rgba），
-纯移动、逻辑不变。PAD 由函数局部提为模块常量。
 """
 from __future__ import annotations
 
@@ -20,15 +16,15 @@ from core.vision import (FIXED_PANEL, FOG_BGR, FOG_TOL, classify_region,
 
 
 # 尺度搜索：游戏内地图缩放随玩家平移/缩放而变，真实尺度常落在 0.7~0.85(面板适配)。
-# 旧版只试 0.4/0.6/0.8/1.0 四档，常擦肩真实尺度→大模板错位、边缘像素全错、分数偏高。
-# 细化到 0.05 步长后 17.13 真种子 0.131→0.106，与第二名拉开(0.264)。
+# 只试 0.4/0.6/0.8/1.0 四档会擦肩真实尺度→大模板错位、边缘像素全错、分数偏高；
+# 细化到 0.05 步长后真种子 0.131→0.106，与第二名拉开(0.264)。
 SCALES = (0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0)
 
 # 对齐(投影重合)专用尺度域：上界放宽到 1.5，下界放宽到 0.30。s = ref像素/面板像素，
-# 实测视图 0.75(整图适配)~0.99(放大)；游戏内还能继续放大，17.13 放大 8% 就要 s=1.065，
-# 超原上界 1.0 会让对齐滑到边界判不可靠。下界：游戏默认（不碰缩放）入口状态 s≈0.40
-# （2026-09-14 实测），正贴旧下界 0.40 且 hint_s 细搜会被 max(s_lo,…)) 截断，故放到
-# 0.30 留余量。种子匹配仍用 SCALES(观测域即可，多搜只增假阳风险)。
+# 实测视图 0.75(整图适配)~0.99(放大)；游戏内还能继续放大（放大 8% 就要 s=1.065），
+# 上界若取 1.0 会让对齐滑到边界判不可靠。下界：游戏默认（不碰缩放）入口状态 s≈0.40
+# （实测），正贴 0.40 会让 hint_s 细搜被下界截断，故放到 0.30 留余量。
+# 种子匹配仍用 SCALES(观测域即可，多搜只增假阳风险)。
 ALIGN_SCALES = tuple(np.round(np.arange(0.30, 1.501, 0.05), 2))
 
 # 内容四周补黑边放宽可行域（刀锋问题）：玩家缩放到「整图刚好适配」时，模板尺寸≈内容尺寸，
@@ -36,15 +32,15 @@ ALIGN_SCALES = tuple(np.round(np.arange(0.30, 1.501, 0.05), 2))
 PAD = 12
 
 # 图标锚点窗搜半径：hint_icon 给定时平移**钉死**在锚定位置(0=不搜平移，只搜尺度)。
-# 迷宫走廊网格自相似，填充 SQDIFF 景观极平——全图搜索锁进错位 146px 的「幽灵相位」
-# （分 0.046/overlap 0.80 双闸全过，2026-09-15 实测 17.13），窗搜给 4px 余量也会漂到
-# 次级幽灵(墙重合 60%→4%)。图标锚定+钉平移: score 0.046/ov 1.00/s 0.986/墙重合 60%。
+# 迷宫走廊网格自相似，代价景观极平——全图搜索可锁进错位 146px 的「幽灵相位」
+# （分 0.046/overlap 0.80 双闸全过），窗搜给 4px 余量也会漂到次级幽灵(墙重合 60%→4%)。
+# 图标锚定+钉平移: score 0.046/ov 1.00/s 0.986/墙重合 60%。
 ANCHOR_RADIUS = 0
 
-# 参考侧预处理缓存（2026-09-17 跟随跟踪专用）。content_bbox + classify_region +
+# 参考侧预处理缓存（跟随跟踪专用）。content_bbox + classify_region +
 # walls_as_floors + to_match3 要 68ms，而它们**只是 (参考图) 的纯函数** —— 跟随每 tick 都要
 # 调一次对齐，不缓存则主线程光这一项就 68ms/次。键由调用方给（传参考图路径）；容量 3。
-# 只在 ref_key 给定时启用，不给则每次现算（热键路径不传 ⇒ 行为与以前逐位一致）。
+# 只在 ref_key 给定时启用，不给则每次现算（热键路径不传）。
 _REF_PACK_CACHE: dict = {}
 REF_CACHE_MAX = 3
 
@@ -117,19 +113,17 @@ def _match_at_scale(ref_oh, temp_cls, temp_mask, bw, bh, s, ref_shape,
         res = consistent_cost(src, tpl, msum)
         off_x, off_y = x0, y0
     # ⚠️ OpenCV 返回顺序是 (minVal, maxVal, minLoc, maxLoc) —— minLoc 是**第 3 个**。
-    # 2026-09-16 实机抓到的重大 bug：这里原写作 `mn, _, _, ml =`，于是 ml 拿到的是
-    # **最大代价**的位置（= 全黑角落），而分数 mn 是最小代价的分数。同一张响应图上
-    # 取分和取点来自两个不同位置 ⇒ 分很漂亮、投影却落在十万八千里（重叠≈0）。
-    # 实机 5/6 张"匹配到了没重合"的直接原因。锚定档（窗搜 radius=0，res 是 1×1）不受
-    # 影响，故 17.13/17.11 这类有线锚定的回归用例一直"看着正常"。
+    # 若写成 `mn, _, _, ml =`，ml 拿到的是**最大代价**的位置（= 全黑角落）而分数是
+    # 最小代价的分数 ⇒ 分很漂亮、投影落在十万八千里（重叠≈0）。锚定档（radius=0，
+    # res 是 1×1）天然免疫此错，故带锚定的回归用例抓不住它。
     mn, _, ml, _ = cv2.minMaxLoc(res)
     return mn / msum, ml[0] + off_x, ml[1] + off_y, res, msum, (off_x, off_y)
 
 
 def _subpixel_min(res, mx, my):
-    """对 SQDIFF 响应面在整数极小点做二次曲线拟合，得亚像素 (x, y)。
+    """对代价响应面在整数极小点做二次曲线拟合，得亚像素 (x, y)。
 
-    分类 SQDIFF 响应面在极小点附近近似抛物面（平移半个像元只改边界像元），
+    分类代价响应面在极小点附近近似抛物面（平移半个像元只改边界像元），
     用 min 及其左右/上下邻值拟合顶点。偏移限幅 ±0.5 像元，退化时不动。
     """
     def _parabola(v_minus, v0, v_plus):
@@ -162,8 +156,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     hint_icon: (ref_cx, ref_cy, screen_ix, screen_iy) 入口图标锚点四元组(M1 的核心)。
             给定时平移搜索限制在锚定位置 ±ANCHOR_RADIUS 邻域，且粗搜全尺度窗扫——
             迷宫走廊网格自相似，全图搜索可锁进错位 146px 的「幽灵相位」且双闸拦不住
-            (2026-09-15 实测 17.13：分 0.046/overlap 0.80 全过但墙重合仅 4%，
-            图标锚定后 67%)。图标是唯一无歧义锚点。
+            (实测：分 0.046/overlap 0.80 全过但墙重合仅 4%，图标锚定后 67%)。
+            图标是唯一无歧义锚点。
     fast:   只在 hint_s 单尺度匹配(平移跟踪用，~30ms；须与 hint_s 同给)。
             玩家平移地图不改尺度，单档即可拿到精确平移；缩放变了分会上来，由调用方降级。
     hint_radius: 覆盖 ANCHOR_RADIUS 的窗搜半径（**只给跟随跟踪用**）。跟踪的锚点是"上一帧
@@ -174,12 +168,12 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
             不给则每次现算。**只影响速度，不影响结果**。
 
     尺度搜索三段式(粗 0.05→细 0.01→微 0.002)+亚像素位置(二次曲线拟合)：
-    旧版只搜 0.05 粗档，真实尺度常落在档间(如 17.13 真尺度 0.986 落在 0.95/1.00 间)，
+    只搜 0.05 粗档时真实尺度常落在档间(如真尺度 0.986 落在 0.95/1.00 间)，
     粗档最优 0.95(score 0.106)实为擦肩，远端可偏 20+ 像元。细化后 0.986(score 0.045)，
     远端对齐显著改善。微搜(0.002)用来逼近真极小(亚像素尺度二次曲线在 0.01 档上不对称、
     不可靠，故用细网格而非抛物插值)。
 
-    ⚠️ **尺度别指望"挑分最小"**（2026-09-17 实测，见 CLAUDE.md 技术备忘⑥）：错配率对 s
+    ⚠️ **尺度别指望"挑分最小"**：错配率对 s
     单调递增（模板越小覆盖越少、离群像素被一起缩掉），真尺度处**不是**极小 ⇒ 全域 argmin
     典型偏低 0.01~0.02、曲线平坦时偏低 0.09。调用方应用可信的尺度来源（导航列缩放滑条
     `vision.zoom_scale_from_roi`，或图标锚点扫描）把 `scales` 收窄，而不是放任全域搜索。
@@ -248,8 +242,8 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
             return None
         sc, s, ml_x, ml_y, res, _msum, _off = r[0], float(hint_s), r[1], r[2], r[3], r[4], r[5]
     else:
-        # 有图标锚点 → 粗搜也走窗搜且全尺度扫（入口匹配 s 与真实 s 可差 ~0.09，17.13
-        # 实测 0.9 vs 0.986——锚住平移后尺度交给全档扫描，别信 hint_s 的窄窗细搜）。
+        # 有图标锚点 → 粗搜也走窗搜且全尺度扫（入口匹配 s 与真实 s 可差 ~0.09，
+        # 如 0.9 vs 0.986——锚住平移后尺度交给全档扫描，别信 hint_s 的窄窗细搜）。
         if hint_s is None or hint_icon is not None:
             coarse = _search(scales)
             if coarse is None:
@@ -297,7 +291,7 @@ def find_overlay_transform(shot_bgr, ref_bgr, panel=FIXED_PANEL, scales=ALIGN_SC
     return M, sc, overlap
 
 
-# ====== 以下从 matcher.py 搬入（标定 / 点变换 / RGBA 悬浮层）======
+# ====== 手动标定 / 点变换 / RGBA 悬浮层 ======
 
 def affine_from_points(src_pts, dst_pts) -> np.ndarray:
     """由对应点估算仿射变换矩阵 M (2x3)，把 src(参考图) 映射到 dst(屏幕)。

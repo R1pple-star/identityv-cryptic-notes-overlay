@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-加页手记 · 摸金地图叠层工具（重构版）
-======================================
+加页手记 · 摸金地图叠层工具
+===========================
 热键(Ctrl+Shift+F) → 入口引索匹配定种子 → 两段式对齐 → 透明投影重合。
 
-一次热键 = 一个任务 = 一个结果。自动跟随·第一步已落地：游戏内 G 开关小地图时
-投影同步显隐（ui/follow.py 轮询 + 投影窗 WDA 截屏排除，见 CLAUDE.md）；其余跟随
-状态机（连续再对齐/自动重匹配）仍推迟，待开合跟随实测可靠后再立项。废弃的整图
-识别(find_seed_submap / find_seed_color / detect_direction)已删，全部走入口引索 + 两段式对齐。
+一次热键 = 一个任务 = 一个结果。自动跟随：游戏内 G 开关小地图时投影同步显隐
+（ui/follow.py 轮询 + 投影窗 WDA 截屏排除）；跟随·第二步让投影跟着地图平移/缩放
+（ui/track.py 局部重对齐）。不做跟随中自动重匹配换种子（只在已确认种子上跟随，
+种子选错须手动「换种子」）。
 
-双闸（见 CLAUDE.md）：
+双闸（量纲不同、各配各的闸，不可互换）：
   入口置信闸 = 入口分 < score_confident(0.45) 且 overlap ≥ overlap_min(0.40)（种子ID可信）
   对齐显示闸 = 重合分 < align_score_max(0.30) 且 overlap ≥ 0.40（投影该显示）
 """
@@ -103,9 +103,9 @@ def _degenerate(res):
 def _lead_frac(res) -> float | None:
     """入口 top1 相对 top2 的领先幅度 ∈[0,1]（分越小越好 ⇒ (top2−top1)/top2）。
 
-    只有一个结果 ⇒ 1.0（其余种子都弃权了，无次名可比；与 e34 口径一致）。无结果 ⇒ None。
-    用途：结构闸的逃生门（见 config `[match].lead_min` 与 experiments/e34_evidence_gate.py）——
-    「样本结构占比」只是"能不能判"的**代理**，而入口层判的是**墙**；用入口层自己的领先幅度更对症。
+    只有一个结果 ⇒ 1.0（其余种子都弃权了，无次名可比）。无结果 ⇒ None。
+    用途：结构闸的逃生门（config `[match].lead_min`）——「样本结构占比」只是
+    "能不能判"的代理，而入口层判的是墙；用入口层自己的领先幅度更对症。
     """
     if not res:
         return None
@@ -117,14 +117,12 @@ def _lead_frac(res) -> float | None:
 # 入口判别力降序：侧门/二楼房间形状各异（主要判别依据）；正门固定分不出种子。
 ENTRANCE_TYPES = ("侧门", "二楼", "正门")
 
-# 状态行的**像素**预算（T2b）。主窗定宽 300 − 左右边距 16 − 圆点 10 − 间距 5 − 余量。
-# 必须按像素截：一行放不下 56 个汉字（≈616px），旧的 `msg[:53]` 是按字数的，改成一行后
-# 会在字中间被硬切（用户截图里「建议手动确」就是这么来的）。
+# 状态行的像素预算。主窗定宽 300 − 左右边距 16 − 圆点 10 − 间距 5 − 余量。
+# 必须按像素截：一行放不下 56 个汉字（≈616px）；按字数截（如 msg[:53]）会硬切在字中间。
 STATUS_MAX_PX = 262
 
-# 折叠后指引用户去手动纠错的统一前缀（T2b）。这几个按钮已不在主窗，文案里直接写
-# 「手框样本/3点标定」会指向不存在的东西 —— 而日志窗默认关着，状态行只显示截断的一句话，
-# 用户更没地方去找。改文案时别退回裸按钮名。
+# 手动纠错入口都收在「⋯ 更多」菜单里、不在主窗，指引文案统一用这个前缀，
+# 别退回裸按钮名（用户找不到入口；日志窗默认关着，状态行只显示截断的一句话）。
 FIX_PATH = "⋯ 更多→手动纠错→"
 
 
@@ -320,7 +318,7 @@ class MainWindow(QWidget):
         # 楼层也接上：摘要行里带楼层，不然改了楼层这行就陈旧了（`_seed` 本身只由方向+门决定）
         self.floor_combo.currentIndexChanged.connect(self._resolve_seed)
 
-        # ---- T2b 主窗 5 按钮（用户 09-19 定的清单，一个不折叠）----
+        # ---- 主窗 5 按钮（一个不折叠）----
         # 折叠进「⋯ 更多」的只有：手框样本 / 手动选点 / 参考图 / 日志 / 回收 / 素材 / 设置 / 退出。
         self.btn_onematch = QPushButton("🔴 一键匹配（=热键）")
         self.btn_onematch.setStyleSheet("font-weight:bold; padding:10px; background:#2a4a2a;")
@@ -348,7 +346,7 @@ class MainWindow(QWidget):
         self.opacity_slider.setValue(int(self.settings.overlay_opacity * 100))
         self.opacity_slider.valueChanged.connect(self._set_opacity)
 
-        # ---- T2b 主窗布局：≈190px（原 ≈520/700）。只有 5 个按钮 + 参考图行 + 状态行 + 滑块 ----
+        # ---- 主窗布局：≈190px。只有 5 个按钮 + 参考图行 + 状态行 + 滑块 ----
         root = QVBoxLayout(); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(5)
         root.addWidget(self.btn_onematch)
         row_align = QHBoxLayout(); row_align.setSpacing(5)
@@ -382,7 +380,7 @@ class MainWindow(QWidget):
         self._on_direction_changed()
         if self.settings.auto_follow:
             self._start_follow()
-        if self.settings.show_log:   # 语义已改为「启动时是否打开日志窗」（T2b）
+        if self.settings.show_log:   # 「启动时是否打开日志窗」
             self._show_log_window()
 
     # ---- 无边框拖动 ----
@@ -414,7 +412,7 @@ class MainWindow(QWidget):
         door = self.door_combo.currentText()
         floor = self.floor_combo.currentText()
         self._seed = self.lib.find_by_clue(direction, door)
-        # T2b：这行现在是主窗的「参考图」摘要（点开 = 方向/门/楼层/入口对话框），
+        # 这行是主窗的「参考图」摘要（点开 = 方向/门/楼层/入口对话框），
         # 所以带上方向-门-楼层，让人不打开对话框也知道当前选的是哪张参考图。
         if self._seed is None:
             self.seed_label.setText(f"参考图: {direction}-{door} 未找到 ▾")
@@ -478,14 +476,14 @@ class MainWindow(QWidget):
         self.btn_floor.setText(f"🔀 换楼层→{tgt}")
 
     def _switch_floor(self):
-        """「🔀 换楼层」（T4）：切到对面楼层并当场重对齐投影。
+        """「🔀 换楼层」：切到对面楼层并当场重对齐投影。
 
         不新增任何匹配逻辑 —— 走 `_align_to`（截屏→滑条/尺子 hint→两段式对齐→过闸投影
         →`_seed_track`）那条路，跟踪器 ref_path 与 `_last_rgba` 自动带上新楼层。
         **入口下拉必须一起切**：二楼只有 1 个入口（楼梯到达点，`ENTRANCE_FLOOR["二楼"]`），
         刚上楼玩家正站在该图标处 ⇒ 锚点（`index.json["二楼"]` 的 cx/cy ↔ 屏幕图标）精确；
         不切的话 `_two_stage_align` 拿着"正门/侧门"锚点配二楼参考图，白白丢掉最强约束。
-        回一楼同理（锚点不适用 → 过不了闸 → 回退全搜，见技术备忘⑪"不会更差"）。
+        回一楼同理（锚点不适用 → 过不了闸 → 回退全搜，不会更差）。
         """
         if self._seed is None:
             self._set_status("请先选好方向+门"); return
@@ -507,12 +505,12 @@ class MainWindow(QWidget):
         et = self._entrance_et or self.entrance_combo.currentText()
         return et if ENTRANCE_FLOOR.get(et) == "一楼" else "正门"
 
-    # ---- 状态灯 / 运行日志（阶段1）----
+    # ---- 状态灯 / 运行日志 ----
     def set_led(self, ok: bool, text: str):
         """启动/热键成败状态灯。ok=True 绿，False 红。
 
-        T2b：从「占一整行的文字条」缩成状态行左边一个 10px 圆点，文案搬进 tooltip。
-        **调用点一个没删** —— 启动失败 / 热键被占用这类反馈全靠它，只是渲染方式变了。
+        渲染成状态行左边一个 10px 圆点，文案在 tooltip。
+        启动失败 / 热键被占用这类反馈全靠它。
         """
         self._led_text = text
         color = "#66ff66" if ok else "#ff6666"
@@ -523,19 +521,17 @@ class MainWindow(QWidget):
     def _log_step(self, msg: str, level: str = "INFO"):
         """一步运行日志：append 进日志区 + 同步 status **那一行**。level: INFO/OK/WARN/ERROR。
 
-        T2b：日志区已搬进日志窗且默认关着 ⇒ **status 那一行是主窗唯一的运行反馈**，
-        所以这里做三件事补偿：
-        ① 按**像素**截断（`STATUS_MAX_PX`）而不是按字数 —— 一行放不下 56 个汉字，
-           旧的 `msg[:53]` 在单行布局下会在字中间硬切；
+        日志窗默认关着 ⇒ **status 那一行是主窗唯一的运行反馈**，所以这里做三件事：
+        ① 按**像素**截断（`STATUS_MAX_PX`）而不是按字数——单行放不下整句，
+           按字数截会在字中间硬切；
         ② 全文进 tooltip（悬停看全）；
         ③ 按 level 染色（黄/红 = 坏消息），日志窗关着时也能一眼看出这句是警告。
         """
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         color = {"ERROR": "#ff6666", "WARN": "#ffcc66", "OK": "#66ff66"}.get(level, "#cccccc")
-        # msg 必须转义：appendHtml 把整串当 HTML 解析，消息里的 `<`（「导航列NCC-0.03(<0.45)」
-        # 「入口领先仅15%(<0.25)」）会被当成标签开头，**把后面整段吃掉**（2026-09-18 bug②：
-        # 日志里所有截断点都恰好紧跟一个 `<`）——正是诊断最需要看的那几条。
+        # msg 必须转义：appendHtml 把整串当 HTML 解析，消息里的 `<`（如「NCC-0.03(<0.45)」）
+        # 会被当成标签开头，**把后面整段吃掉**——那常是诊断最需要看的部分。
         self.log_view.appendHtml(f'<span style="color:{color}">[{ts}] {html.escape(msg)}</span>')
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -580,9 +576,8 @@ class MainWindow(QWidget):
             self._log_step(tb, "ERROR")
 
     def _entrance_pipeline_impl(self):
-        # T3：按热键（=「🔴 一键匹配」）就是"重新自动来一次" ⇒ 清空换种子黑名单。
-        # 用户原话：「按"自动匹配"时就把黑名单重置防止匹配不到种子」—— 不清的话按着按着
-        # 候选就被自己拉黑光了，反而匹配不到。
+        # 按热键（=「🔴 一键匹配」）= "重新自动来一次" ⇒ 清空换种子黑名单——
+        # 不清的话按着按着候选就被自己拉黑光了，反而匹配不到。
         self._seed_bl.clear()
         if not self._capture():
             return
@@ -593,7 +588,7 @@ class MainWindow(QWidget):
             self._log_step(f"屏幕 {shot.shape[1]}×{shot.shape[0]} 未适配（非16:9且未校准；"
                            "config.toml [panel.rects] 可加校准）", "ERROR")
             return
-        # 地图画面闸（CLAUDE.md 待办 3）：大厅/结算/桌面等非地图画面按下热键，跑完入口匹配
+        # 地图画面闸：大厅/结算/桌面等非地图画面按下热键，跑完入口匹配
         # 只会给出一个**无意义却看着挺像**的种子。判据与跟随同源（导航列 NCC 或 雾兜底），
         # 见 core/vision.py 的 NAV_BAND 长注。此处只记日志、不动投影（跟随自己会隐）。
         opened, why = map_is_open(shot, panel)
@@ -611,11 +606,11 @@ class MainWindow(QWidget):
                                    icon_k=icon_k)
         # 快速失败闸：样本结构太少=入口周围未探明/迷雾占屏，跑匹配只会出
         # 多种子同分0.000的误导结果（实测坏样本mask≤15.6%、好样本≥24.7%，见 config）
-        # **逃生门（2026-09-18）**：结构占比只是"能不能判"的**代理**，而入口层判的是**墙**
+        # **逃生门**：结构占比只是"能不能判"的**代理**，而入口层判的是**墙**
         # （被拒样本里仍含 581~1348 个墙像素）。入口匹配已经跑完了(res) ⇒ 直接用**入口层
         # 自己的领先幅度**判：top1 领先次名 ≥ `lead_min` 就放行。
-        # 依据 experiments/e34_evidence_gate.py（44 张主集）：领先≥0.25 时**出图且对 14→21
-        # （+7）、出图但错仍是 3 张没多**；领先≥0.15 就开始崩（错 3→10）。
+        # 实测（44 张主集）：领先≥0.25 时**出图且对 14→21（+7）、出图但错仍是 3 张没多**；
+        # 领先≥0.15 就开始崩（错 3→10）。
         _cls, smask = sample_structure(sample)
         if smask.mean() < SAMPLE_MASK_MIN:
             lead = _lead_frac(res)
@@ -631,10 +626,9 @@ class MainWindow(QWidget):
         self._show_sample_preview(sample)  # 让玩家看到匹配用的样本
         dom = _dominant_frac(_cls, smask)
         # 扩大取样梯子：单类占比过高 = 入口周围是单一均匀区（大片走廊/雾），分类
-        # SQDIFF「样本覆盖处类别全等」⇒ 多种子精确同分（2026-09-14 实测 98% cls3 →
-        # 种子2/18 同分 0.000）。扩大取样纳入更多结构可拉开分差（145440@0.25 →
-        # 种子2 0.0069 vs 次名 0.045）。只在「当前档仍退化」时降档、首个非退化即停
-        # ——0.32 档可能把并列翻成错误种子的假干净（实测 144715@0.32 翻成种子18）。
+        # SQDIFF「样本覆盖处类别全等」⇒ 多种子精确同分（实测 98% cls3 → 种子2/18 同分
+        # 0.000）。扩大取样纳入更多结构可拉开分差（0.25 档 → 种子2 0.0069 vs 次名 0.045）。
+        # 只在「当前档仍退化」时降档、首个非退化即停——0.32 档可能把并列翻成错误种子。
         if dom > DOMINANT_CLS_MAX:
             retried = False
             for hf in SAMPLE_LADDER:
@@ -759,14 +753,14 @@ class MainWindow(QWidget):
                 _M, asc, ov = align
                 if asc < ALIGN_SCORE_MAX and ov >= OVERLAP_MIN:
                     return align
-        # 回退：全搜（baseline verify_entrance_e2e 证 17.13/17.11 全搜可靠）
+        # 回退：全搜（eval/verify_entrance_e2e 回归覆盖此路径）
         return find_overlay_transform(shot, ref, panel)
 
     def _realign_hints(self, shot, panel) -> tuple:
         """「按此种子对齐」的 hint：与热键路径同源 —— `hint_s` 尺度提示 + `hint_icon` 图标锚点。
 
         `hint_s` 取**缩放滑条读数**（`zoom_scale_from_roi`，±0.01，全量程已标定）而不是
-        「挑分最小的尺度」：分对尺度是单调偏低的（技术备忘⑥），挑分必然挑到更小的那个。
+        「挑分最小的尺度」：分对尺度单调偏低，挑分必然挑到更小的那个。
         读不到滑条（窗口化布局，导航列 NCC 掉到 0.34 < 闸 0.45）时回退图标尺子 `0.374/k`。
         """
         s_ui, _why = zoom_scale_from_roi(roi_of(shot, panel), panel)
@@ -779,26 +773,18 @@ class MainWindow(QWidget):
     def _align_to(self, seed, floor: str, et: str, label: str) -> bool:
         """**当场截屏** → 用指定种子走两段式对齐 → 过闸投影。返回是否投影成功。
 
-        `_realign`（用户手选种子）与 `_swap_seed`（换种子候选）共用这一条路 ——
-        保证「按此种子重新对齐」和「换种子」用的是**同一个对齐方式**（T1.5 的教训：
-        用户原话「把匹配时的对齐方式用在其他跟随和对齐的时候」）。
+        `_realign`（手选种子）与 `_swap_seed`（换种子候选）共用这一条路 ——
+        保证两个入口用的是**同一个对齐方式**。两个关键点：
 
-        2026-09-19 修的两处（用户报「点『按此种子对齐』按钮对齐也是不准的」）都在这条路上：
+        ① **必须当场重新截屏**。若复用 `self._shot`（只在从未截过屏时才截），按钮对齐的
+           其实是**上一次热键那张旧图**，投影于是落在「地图当时所在」的位置——
+           多次点击而分数/重叠逐位相同，就是用了同一张旧图的指纹。
 
-        ① **必须当场重新截屏**。旧写法 `if self._shot is None and not self._capture()`
-           只在从未截过屏时抓一张 ⇒ 按钮对齐的其实是**上一次热键那张旧图**，投影于是落在
-           「地图当时所在」的位置。实机日志的指纹很干净：`手动重对齐: 南-三缺一门
-           重合0.05 重叠1.00 已投影` 在 4 分钟里出现 **8 次**（15:40:00/06/14/18、
-           15:42:43/54/57/59），**分数与重叠一字不差** —— 中间地图已挪过好几处，只有
-           「同一张旧图 + 同一个变换」才会给出逐位相同的结果。
-
-        ② **把热键路径的对齐方式搬过来**。旧写法是无锚点无尺度提示的全搜，而全搜在**这一帧**
-           上就给出骗人的答案：实测 `captures/hotkey_20260919_154124.png` 全搜得
-           s≈0.39 / 分0.038 / 重叠1.00（**过闸**），真值是 s≈0.83（图标尺子 0.374/k，k=0.45）
-           —— 技术备忘① 的「缩模板骗分」在尺度轴上重演：模板缩小 ⇒ 不一致像素被一起缩掉
-           ⇒ 分更低。热键路径靠 `hint_s`（入口匹配尺度）+ `hint_icon`（图标钉死平移）双重
-           约束才稳，这里同样给（见 `_realign_hints`）。两者缺失只是退化成「少一层约束」；
-           都不过对齐显示闸就**回退全搜**，等于旧行为，不会更差。
+        ② **复用热键路径的约束**（`_realign_hints` 给 `hint_s` 滑条读数 + `hint_icon`
+           图标锚点）。无锚点无尺度提示的全搜会被「缩模板骗分」骗过闸：模板缩小 ⇒
+           不一致像素被一起缩掉 ⇒ 分更低，实测全搜可得 s≈0.39 / 分0.038 / 重叠1.00
+           （过闸）而真值 s≈0.83。约束缺失只是退化成「少一层约束」；不过对齐显示闸
+           就**回退全搜**，等于无提示的旧行为，不会更差。
         """
         info = self.lib.get(seed, floor)
         if info is None:
@@ -841,8 +827,8 @@ class MainWindow(QWidget):
     def _swap_seed(self):
         """「🔄 换种子」：把当前种子拉黑，用入口层排名里的下一个候选取代，重跑对齐。
 
-        **点一下 = 拉黑当前 + 试下一个**（用户 2026-09-19 定的触发模型）。点这个按钮的
-        理由本身就是"这个种子不对"，若改成"等对齐失败才拉黑"，用户得点两次才见效。
+        **点一下 = 拉黑当前 + 试下一个**。点这个按钮的理由本身就是"这个种子不对"，
+        若改成"等对齐失败才拉黑"得点两次才见效。
 
         候选 = `find_seed_by_entrance` 的入口层排名（`self._entrance_res`，热键路径存下的）。
         入口层 top-1 只有 ≈48%，已知稳定失败场景就是「北-1沙发门(23) 被判成 北-1门(10)」
@@ -867,7 +853,7 @@ class MainWindow(QWidget):
             return
         sc, seed, key, _fl, _s, _mloc = cand[0]
         self._tried_seed = int(seed)
-        # ⚠️ 停在**当前楼层**（T4）：候选自带的 fl 是「入口匹配那一层」——用户已用「换楼层」
+        # ⚠️ 停在**当前楼层**：候选自带的 fl 是「入口匹配那一层」——用户已用「换楼层」
         # 切到二楼后再点换种子，若用候选的 fl 会被拽回一楼对齐（人明明在二楼）。
         # 种子号与楼层无关（28 种子两层齐），楼层只挑参考图文件。
         fl = self.floor_combo.currentText()
@@ -915,8 +901,7 @@ class MainWindow(QWidget):
         x0, y0, x1, y1 = pk.rect
         sample = self._shot[y0:y1, x0:x1].copy()
         # 尺度硬上限：SCALES_ENT 最小 0.35，样本边 × s 须 ≤ 引索裁图 228px → 228/0.35≈650
-        # 超限全尺度放不下 → 各种子直接跳过、res 恒空（2026-09-14 实测手框 408px「仍无匹配」即此因，
-        # 380px 旧上限是 0.6 下限时代所设）。
+        # 超限全尺度放不下 → 各种子直接跳过、res 恒空（实测 408px 手框即因超限「仍无匹配」）。
         if max(sample.shape[:2]) > 650:
             self._log_step(f"手框 {x1-x0}x{y1-y0} 超过650px（引索尺度下限 0.35×228）→ "
                            "请框含墙角/房间边缘结构的区域", "WARN")
@@ -944,8 +929,8 @@ class MainWindow(QWidget):
     def _screen_size(self):
         # 用 mss 主显示器物理尺寸（DPI aware 后=物理像素），与截屏/面板坐标一致；
         # 不用 Qt primaryScreen.geometry()（DPI 缩放下可能返回逻辑像素致错位）。
-        # **缓存在 self._screen_wh**：跟随跟踪每 tick 都要烘焙投影，若每次现开 mss
-        # 就是 2026-09-14 那个「GDI DC 开合 4 次/秒毁英伟达截图」的坑（见 ui/capture）。
+        # **缓存在 self._screen_wh**：跟随跟踪每 tick 都要烘焙投影，反复开合 mss 的
+        # GDI DC 会毁英伟达截图（见 ui/capture），必须复用。
         if self._screen_wh is None:
             self._screen_wh = monitor_size(1)
         return self._screen_wh
@@ -1018,13 +1003,12 @@ class MainWindow(QWidget):
         self.preview.show()
 
     def _refuse(self, label, why):
-        """不确信 / 对齐没过闸 ⇒ **一张图都不显示**（待办 1，2026-09-16 晚）。
+        """不确信 / 对齐没过闸 ⇒ **一张图都不显示**。
 
-        旧行为是 `_show_centered_if_any` → `auto_align_overlay` 把参考图按
-        `min(pw/cw, ph/ch)` **缩放铺满迷雾面板**：比例与游戏内毫无关系，却画得工整、
-        结构清楚，看起来就像一张"已经对齐好的地图"—— 用户报的「乱给一张素材、
-        比例都不对」就是它，不是对齐结果。宁可什么都不给，也不给一张像是对的的假图：
-        假图会让人以为算法定位到了别处，比空白有害得多。
+        （曾有的"兜底居中显示"会把参考图按 `min(pw/cw, ph/ch)` 铺满迷雾面板：比例与
+        游戏内毫无关系，却画得工整，看起来就像一张"已对齐好的地图"。）
+        宁可什么都不给，也不给一张像是对的的假图：假图会让人以为定位到了别处，
+        比空白有害得多。
 
         种子ID仍写进状态栏与日志（那个数是有意义的）；想看参考图请显式用主窗
         「▶ 按此种子重新对齐」，或「⋯ 更多→手动纠错→手动选点重合」（3 点标定）。
@@ -1103,10 +1087,9 @@ class MainWindow(QWidget):
         if self.overlay is None:
             self._follow.idle_reset()
             return
-        # 两种「投影不在」必须分开（2026-09-17，用户报「关了按 G 也不会再开」）：
-        #   手动隐藏 = 明确的用户意图 ⇒ 停一切屏幕检测；
+        # 两种「投影不在」必须分开：手动隐藏 = 明确的用户意图 ⇒ 停一切屏幕检测；
         #   跟随判出地图关 = 只是「现在看不到」⇒ 降频续看，等 G 把地图开回来。
-        # 旧版两者都早退 ⇒ 关一次地图之后 G 再也唤不回投影，只能点按钮或按热键重匹配。
+        #   （若两者都停检测，关一次地图之后 G 再也唤不回投影。）
         visible = self.overlay.isVisible()
         if not visible and self._follow.suspended:
             if not self._follow_poll_paused:
@@ -1142,7 +1125,7 @@ class MainWindow(QWidget):
             if visible and self._follow.confirmed is True:
                 self._maybe_track(roi, is_open, nav_ok)
             elif visible:
-                # 心跳（§4 第 3 条静默路径）：投影显示着却没进跟踪链 —— `confirmed` 每次热键
+                # 心跳：投影显示着却没进跟踪链 —— `confirmed` 每次热键
                 # 出图都被 `_show_overlay` 的 `reset()` 清成 None，要连续 2 帧同判才重立。
                 self._track_beat(f"投影显示但不开跟踪（confirmed={self._follow.confirmed} "
                                  f"track_active={self._track.active}）")
@@ -1188,13 +1171,9 @@ class MainWindow(QWidget):
         try:
             self._track_tick(roi, is_open, nav_ok)
         except Exception as e:  # noqa: BLE001
-            # 跟踪主体**必须自己报错**，不许静默死掉。
-            # 2026-09-19 查出的实机病根就是这个：`ui.track` 的 `TRACK_DEADBAND_S` /
-            # `TRACK_OVERLAP_MIN` 与 `ui.follow` 的 `FOLLOW_MAX_CAPTURE_ERRORS` **没进
-            # app.py 的 import 列表** ⇒ 自 `1b888e7`（跟随·第二步）起每次过闸都在写第一行
-            # 日志之前抛 `NameError`，traceback 只进 stderr（用户看不到），心跳里只剩
-            # 「帧差…画面没动」⇒ 实机 56 次过闸、零条输出。技术备忘③ 同款教训：
-            # **走不到那条分支**等于没有记录，先让失败可见。
+            # 跟踪主体**必须自己报错**，不许静默死掉：曾因 import 漏名，跟踪在写第一条
+            # 日志之前就抛 NameError、traceback 只进 stderr，表现成"56 次过闸零条输出"。
+            # 教训：**走不到那条分支**等于没有记录，先让失败可见。
             self._track_err += 1
             if self._track_err <= 3 or self._track_err % 50 == 0:
                 self._log_step(f"跟踪内部异常 #{self._track_err}"
@@ -1203,14 +1182,13 @@ class MainWindow(QWidget):
     def _track_beat(self, msg: str, force: bool = False):
         """跟踪**心跳**：把「这一 tick 走了哪条路」写进日志（限流 `TRACK_BEAT_MIN_SEC`）。
 
-        2026-09-18 立：实机日志 126 秒 / ~500 个 tick 里 `投影跟着地图更新` **0 条**，而三条
-        静默路径（帧差闸跳过 / 采纳但落在死区内 / `_maybe_track` 根本没被调到）在日志上完全
-        同形，只能靠猜。心跳把三者分开：帧差闸那条会留下「画面没动」，采纳那条会留下
-        「小窗/全平移 + 分/ov」，一条都不出说明是第三条（接线问题）。
+        动机：三条静默路径（帧差闸跳过 / 采纳但落在死区内 / `_maybe_track` 根本没被调到）
+        在日志上完全同形，只能靠猜。心跳把三者分开：帧差闸那条会留下「画面没动」，
+        采纳那条会留下「小窗/全平移 + 分/ov」，一条都不出说明是第三条（接线问题）。
 
-        ⚠️ **限流会把要看的尖峰采样掉**（09-18 第二版教训）：tick 250ms、心跳 1.5s ⇒ 每 6 个
-        tick 只记 1 个，而用户拖缩放往往就 1 秒（4 个 tick）。第二份实机日志里 35 条心跳
-        **全是** `帧差0.00`，看着像「检测不到屏幕变化」，其实只是那 4 个 tick 没被采到。
+        ⚠️ **限流会把要看的尖峰采样掉**：tick 250ms、心跳 1.5s ⇒ 每 6 个 tick 只记 1 个，
+        而一次拖缩放往往只有 1 秒（4 个 tick）——只记瞬时值必然漏掉尖峰，日志里全是
+        `帧差0.00` 看着像「检测不到屏幕变化」，其实只是没被采到。
         ⇒ 两条对策：`帧差` 那条记**本轮峰值**（窗口内最大值，尖峰跑不掉）；过闸/刚确立这类
         **稀有且关键**的事件 `force=True` 绕过限流（它们一次只该出几条）。
         """
@@ -1233,8 +1211,7 @@ class MainWindow(QWidget):
             # 本帧判「地图关」（G 关闭动画的过渡帧；状态机要连续 2 帧才确认，这半秒里
             # confirmed 仍是 True ⇒ 本函数会被调到）。此时**不跟踪、更不判丢**：
             # 过渡帧导航列 NCC 掉到 -0.03 ⇒ 滑条/图标尺子全失效 ⇒ 若照常判丢，连丢 2 次就
-            # 会把投影隐藏 + 清 `_last_rgba`，于是 G 开回来时无图可放回（2026-09-18 bug①：
-            # 19:41:32 跟丢 → 19:41:33 投影隐藏 → 19:41:58「上次没有成功投影」）。
+            # 会把投影隐藏 + 清 `_last_rgba`，于是 G 开回来时无图可放回。
             return
         px, py, pw, ph = self._follow_panel
         rx, ry, _x1, _y1 = map_roi(self._follow_panel)
@@ -1249,10 +1226,10 @@ class MainWindow(QWidget):
         mad = float(np.abs(small - prev).mean()) if prev is not None else None
         # `mad is None` = 本次跟随的**第一** tick（`_panel_prev` 刚被 `_start_follow` 清成 None）。
         # 它不过闸（没有上一帧可比，就当"动过"），于是会走到下面那条路 —— 那里所有日志都用
-        # `{mad_s}` 而不是 `{mad_s}`：`None:.2f` 会抛 TypeError（2026-09-19 一并修）。
+        # `mad_s`（字符串）而不是 `mad`：`None:.2f` 会抛 TypeError。
         mad_s = "--" if mad is None else format(mad, ".2f")
         # 心跳限流 1.5s = 每 6 个 tick 才记 1 条，而一次拖缩放往往只有 1 秒（4 个 tick）
-        # ⇒ 只记瞬时值必然漏掉尖峰（09-18 第二份日志 35 条心跳全是 0.00 就是这么来的）。
+        # ⇒ 只记瞬时值必然漏掉尖峰。
         # 记**本轮峰值**：只要这 1.5s 里有过 4.30，就一定会出现在日志里。
         self._mad_peak = max(self._mad_peak, mad or 0.0)
         if mad is not None and mad < TRACK_MOTION_MAD:
@@ -1268,7 +1245,7 @@ class MainWindow(QWidget):
             tr.reset(); return
 
         # 尺度：两个「量出来的」源，优先级 滑条(1ms,±0.01) > 图标尺子(200ms,±0.05/k)。
-        # 对齐分选不出尺度（vision.ZOOM_CURVE_C 长注 + CLAUDE.md ⑥）。
+        # 对齐分选不出尺度（vision.ZOOM_CURVE_C 长注）。
         s_ui, why_s = zoom_scale_from_roi(roi, self._follow_panel)
         s_src = "滑条"
         if s_ui is None:
@@ -1299,17 +1276,17 @@ class MainWindow(QWidget):
         # 尺度变了就不走小窗：在**错尺度**上小窗也能找到低分位置（实测假接受，图标偏 78~180px）
 
         # 1.5) 一个尺度源都没有 ⇒ **不做全平移，就地判丢**。没有可信尺度时，全平移的全局极小
-        #      会落在错位置上，而且**错尺度分更低**（2026-09-18 实测：真尺度 0.42 全局极小
-        #      0.086，错尺度 0.30 反而 0.126、图标偏 840px）⇒ 没有任何分数闸能分辨。
+        #      会落在错位置上，而且**错尺度分更低**（实测：真尺度 0.42 全局极小 0.086，
+        #      错尺度 0.30 反而 0.126、图标偏 840px）⇒ 没有任何分数闸能分辨。
         #      小窗（±12px）是有界的、且要过 TRACK_OK 才采纳，所以上面试完就可以收手了；
-        #      连丢 TRACK_LOST_MAX 次会隐藏投影 —— 与「宁可什么都不给」一致（待办 1）。
+        #      连丢 TRACK_LOST_MAX 次会隐藏投影 —— 与「宁可什么都不给」一致。
         if s_ui is None:
             self._track_beat(f"帧差{mad_s} 尺度源无（{why_s}）→ 判丢", force=True)
             self._track_lost(f"没有可信的尺度（{why_s}）", is_open, trusted)
             return
 
         # 2) 上一帧位置对不上了 ⇒ 换尺度做单尺度全平移。候选**按优先级**逐个试、谁先过闸用谁；
-        #    **绝不"挑分最小的那个尺度"** —— 分对 s 单调偏低（技术备忘⑥），滑条值 0.35 与旧值
+        #    **绝不"挑分最小的那个尺度"** —— 分对 s 单调偏低，滑条值 0.35 与旧值
         #    0.31 同场竞逐时挑分必选 0.31，于是又滑回旧尺度、投影偏 26px。
         cands = [s_ui]
         if abs(s_ui - tr.s) > 0.02:
@@ -1364,11 +1341,10 @@ class MainWindow(QWidget):
         `_last_rgba` 是「G 重开地图放回哪张」的**唯一**来源，只在**地图确实开着**时清。
         两个条件都要：
         - `is_open` = 本 tick 的原始开合读数。G 的关闭动画帧也会走到判丢（见 `_track_tick`
-          开头），那种「丢」是假的，把图清了就再也放不回来（2026-09-18 bug①）。
+          开头），那种「丢」是假的，把图清了就再也放不回来。
         - `trusted` = 这个「开」是**导航列主判据**说的。雾兜底是低精度高召回，关闭动画帧里
-          导航列 NCC 掉到 −0.01（列根本不在）而雾 0.41 ⇒ 照样判「开」⇒ 光靠 `is_open`
-          拦不住。实机 22:52:35 就是这么丢的：判丢 → 清图 → 22:52:42「上次没有成功投影
-          ⇒ 不自动恢复」。所以雾兜底说的「开」只敢隐藏投影，不敢销毁 `_last_rgba`。
+          导航列 NCC 掉到 −0.01（列根本不在）而雾仍 ≥ 阈值 ⇒ 照样判「开」⇒ 光靠 `is_open`
+          拦不住。所以雾兜底说的「开」只敢隐藏投影，不敢销毁 `_last_rgba`。
         """
         tr = self._track
         n = tr.note_lost()

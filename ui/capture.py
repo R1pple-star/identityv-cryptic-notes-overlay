@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import numpy as np
 
-# 常驻 mss 实例（懒初始化单例）。跟随轮询 250ms 一次，旧版每 tick `with mss.mss()`
-# 新建+销毁 DC 句柄，4次/秒的 GDI 开合循环会干扰英伟达截屏（2026-09-14 用户实测：
-# 软件常驻时 NVIDIA 截图失效，关软件才恢复）。所有调用都在 Qt 主线程，无线程问题。
+# 常驻 mss 实例（懒初始化单例）。跟随轮询 250ms 一次，若每 tick `with mss.mss()`
+# 现开现关，4次/秒的 GDI DC 开合循环会干扰英伟达截屏（软件常驻时 NVIDIA 截图失效，
+# 关软件才恢复）。所有调用都在 Qt 主线程，无线程问题。
 _SCT = None
 
 
@@ -36,8 +36,8 @@ def capture_region(left: int, top: int, width: int, height: int) -> np.ndarray:
 def monitor_size(index: int = 1) -> tuple[int, int]:
     """显示器物理尺寸 (宽, 高)。index 从 1 开始（1=主显示器）。
 
-    复用常驻单例 —— **不要**在跟随循环里 `with mss.mss()` 现开现关：那是 2026-09-14
-    毁英伟达截图的同一个坑（4 次/秒的 GDI DC 开合），单例之后才不成立。
+    复用常驻单例 —— **不要**在跟随循环里 `with mss.mss()` 现开现关：4 次/秒的
+    GDI DC 开合会毁英伟达截图，单例之后才不成立。
     """
     m = _sct().monitors[index]
     return int(m["width"]), int(m["height"])

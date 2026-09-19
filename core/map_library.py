@@ -45,6 +45,10 @@ class MapInfo:
         return f"{self.direction}-{self.door}"
 
 
+# 项目根（core/ 上一层）：相对路径的 map_library 按它解析，与运行时 cwd 无关
+ROOT = Path(__file__).resolve().parent.parent
+
+
 @dataclass
 class MapLibrary:
     """按种子和楼层索引的地图库。"""
@@ -55,7 +59,10 @@ class MapLibrary:
 
     @classmethod
     def load(cls, base_dir: str | os.PathLike) -> "MapLibrary":
-        lib = cls(base_dir=Path(base_dir))
+        base = Path(base_dir)
+        if not base.is_absolute():
+            base = (ROOT / base).resolve()
+        lib = cls(base_dir=base)
         lib.scan()
         return lib
 

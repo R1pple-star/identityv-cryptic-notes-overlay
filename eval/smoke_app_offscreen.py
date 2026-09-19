@@ -83,19 +83,19 @@ def main():
             check("_track_lost 连丢 2 次 ⇒ 隐藏投影并断根",
                   (not win.overlay.isVisible()) and win._last_rgba is None
                   and not win._track.active, f"lost={win._track.lost}")
-            # 2026-09-18 bug①：G 关闭动画帧引起的判丢**不许清 _last_rgba**（地图重开要放回）
+            # G 关闭动画帧引起的判丢**不许清 _last_rgba**（地图重开要放回）
             win._paint_overlay(rgba)
             win._track_lost("冒烟", False); win._track_lost("冒烟", False)
             check("_track_lost 地图判关时判丢 ⇒ 隐藏但留住 _last_rgba（G 重开可恢复）",
                   (not win.overlay.isVisible()) and win._last_rgba is rgba)
-            # 2026-09-18 bug① 的另一半：本 tick 判「地图关」⇒ 连跟踪都不做（更不判丢）。
+            # 同理：本 tick 判「地图关」⇒ 连跟踪都不做（更不判丢）。
             # G 关闭动画那半秒里 confirmed 仍是 True ⇒ _maybe_track 照旧会调 _track_tick。
             win._seed_track(shot, 2, "一楼", info.path, r[0])
             win._panel_prev = None
             win._track_tick("不是 ROI", False)      # 若没早退，这里会因 roi 类型不对而抛异常
             check("_track_tick 地图判关 ⇒ 本 tick 直接返回（不跟踪、不判丢、不动作）",
                   win._track.lost == 0 and win._track.active and win._panel_prev is None)
-            # 2026-09-18 bug① 第二半：**雾兜底**说的「开」也不算数 —— 关闭动画帧里导航列
+            # **雾兜底**说的「开」也不算数 —— 关闭动画帧里导航列
             # NCC 掉到 −0.01（列根本不在）而雾 0.41 ⇒ map_open_from_roi 照样判「开」，
             # 只靠 is_open 拦不住（实机 22:52:35 判丢 → 清图 → 22:52:42「上次没有成功投影」）。
             win._paint_overlay(rgba)
@@ -123,17 +123,17 @@ def main():
         fake = np.zeros((wh[1], wh[0], 3), np.uint8)
         print(f"  {wh} -> {detect_fog_panel(fake)}")
 
-    # ---- T2b：主窗重排（5 按钮 + 参考图行 + 状态行 + 滑块）----
+    # ---- 主窗重排（5 按钮 + 参考图行 + 状态行 + 滑块）----
     # 覆盖：尺寸 KPI / 5 按钮接线 / combo 搬进对话框后仍是本体（信号没断）/ 日志窗关开不丢日志 /
     #      LED 不占行 / 状态行按像素截断 + 配色 + tooltip / WARN 染色。
     hint = win.sizeHint()
-    print(f"主窗 sizeHint = {hint.width()}x{hint.height()}（T2b 目标 ≤210）")
-    check("主窗高度 ≤ 210px（T2b 主 KPI）", hint.height() <= 210, f"h={hint.height()}")
+    print(f"主窗 sizeHint = {hint.width()}x{hint.height()}（目标 ≤210）")
+    check("主窗高度 ≤ 210px（主 KPI）", hint.height() <= 210, f"h={hint.height()}")
     for name in ("btn_onematch", "btn_realign", "btn_swap", "btn_hide", "btn_floor", "btn_options"):
         b = getattr(win, name, None)
         check(f"主窗按钮 {name} 在且已接线",
               b is not None and n_recv(b, "2clicked(bool)") > 0)
-    check("btn_realign 文案 = 按此种子重新对齐（用户 09-19 纠正过的字面）",
+    check("btn_realign 文案 = 按此种子重新对齐",
           "重新对齐" in win.btn_realign.text())
     check("btn_swap 初始置灰（还没匹配过，没有候选）", not win.btn_swap.isEnabled())
     # 参考图对话框：combo 必须是**本体**（`is` 判等），否则 _realign 读的还是主窗那批空壳
@@ -153,7 +153,7 @@ def main():
     # 日志窗：关掉再开，日志不丢（对象没被销毁）
     win._show_log_window()
     lw = win._log_window
-    win._log_step("T2b 冒烟：日志窗保活测试", "INFO")
+    win._log_step("冒烟：日志窗保活测试", "INFO")
     n_before = len(win.log_view.toPlainText())
     lw.close(); win._show_log_window()
     check("日志窗 关→开 复用同一对象且日志未丢",
@@ -238,7 +238,7 @@ def main():
         win._entrance_pipeline_impl()
     finally:
         win._capture = real_capture
-    check("T3 按热键 ⇒ 黑名单清空（用户在按之前就清了，不依赖后面走多远）",
+    check("按热键 ⇒ 黑名单清空（在按之前就清了，不依赖后面走多远）",
           win._seed_bl == set(), f"bl={sorted(win._seed_bl)}")
 
     # ---- T4：换楼层（困难模式 一楼⇄二楼 直切 + 入口锚点同步）----
@@ -289,7 +289,7 @@ def main():
     check("T4 种子未定 ⇒ 换楼层按钮置灰", not win.btn_floor.isEnabled())
     win._select_ref(inf23.key, "一楼")          # 复位，别影响后面的段落
 
-    # ---- T2a：样本预览窗自动消失（2026-09-19）----
+    # ---- 样本预览窗自动消失 ----
     # 覆盖：到点消失 / 光标还在窗上时续期 / 拖动时续期 / 0 秒=不消失（旧行为）/
     #      hide→show 复用同一 HWND（钉死 WDA_EXCLUDEFROMCAPTURE 不丢）。
     bgr = np.zeros((120, 160, 3), np.uint8)

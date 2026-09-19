@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""只改缩放时跟随为什么不跟/不准 —— 用 09-18 那 4 帧演示（种子12，侧门）离线复刻。
+"""只改缩放时跟随为什么不跟/不准 —— 用 4 帧「只拖缩放滑条」的演示序列（种子12，侧门）离线复刻。
 
 真值来源：图标锚点法（引索 json 的图标 ref 坐标 ↔ `_find_icon` 的屏幕实测位置）。
 4 帧里屏幕图标几乎不动（(1097,486)→(1089,526)，全程只挪 40px）而尺度变了 3.7 倍
 ⇒ **游戏缩放是绕图标（玩家）为中心的**。
 
 A 每帧真值（圆点 y / 滑条读数 / 真尺度 / 图标尺子 0.374÷k）
-B 复刻 app._track_tick 的**新**逻辑：滑条(1ms) → 图标尺子(200ms) → 两个都没有就地判丢
+B 复刻 app._track_tick 的逻辑：滑条(1ms) → 图标尺子(200ms) → 两个都没有就地判丢
 B2 只留图标尺子（模拟导航列被挡但图标可见）—— 备用源必须也能跟住
 C 对照：两个尺度源都掐掉（模拟窗口化/图标也看不到）⇒ 只许小窗有界微调，大动就判丢
 
@@ -17,9 +17,12 @@ from pathlib import Path
 
 import numpy as np
 
+import tomllib
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+_CFG = tomllib.load(open(ROOT / "config.toml", "rb"))
 
 from core.alignment import find_overlay_transform  # noqa: E402
 from core.entrance import load_index  # noqa: E402
@@ -29,11 +32,11 @@ from core.vision import (_find_icon, load_bgr, map_roi, panel_for_screen,  # noq
 from ui.track import (TRACK_DEADBAND_S, TRACK_NEAR_R, TRACK_OK, Tracker,  # noqa: E402
                       ruler_slop, verdict)
 
-NVIDIA = Path(r"D:\Videos\NVIDIA\IdentityV")
+NVIDIA = Path(_CFG["paths"]["shot_library"])
 PANEL = panel_for_screen(1920, 1080)
 PX, PY, PW, PH = PANEL
 RX, RY = map_roi(PANEL)[:2]
-LIB = MapLibrary.load(r"D:\Pictures\20260818摸金地图")
+LIB = MapLibrary.load(_CFG["paths"]["map_library"])
 SEED, FLOOR, ENT = 12, "一楼", "侧门"
 DEMO = ["11.07.13.59", "11.07.15.58", "11.07.21.41", "11.07.23.86"]
 SCAN = tuple(np.round(np.arange(0.15, 1.11, 0.05), 2))
@@ -82,7 +85,7 @@ for t in DEMO:
           + (f"   ⚠ 滑条读数失败：{why}" if s_ui is None else ""))
 
 
-# ---- B/C) 复刻 app._track_tick（新逻辑） ----
+# ---- B/C) 复刻 app._track_tick ----
 def replay(label, scale_mode="auto"):
     """复刻 app._track_tick，返回 {'errs': [采纳后图标误差], 'lost': 累计判丢} 供断言。"""
     print()

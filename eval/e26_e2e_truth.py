@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""eval 换口径（待办 2）：按「按下热键后屏幕上最终出现的东西是否正确」统计。
+"""按「按下热键后屏幕上最终出现的东西是否正确」统计真实通过率。
 
 逐张复刻 app 的完整决策链（样本闸 → 入口匹配 → 两段式对齐 → 显示闸），并同时算
-**反事实**：如果把样本结构闸放开，这张会判对还是判错（决定待办 5 该不该动）。
+**反事实**：如果把样本结构闸放开，这张会判对还是判错（衡量结构闸的代价/收益）。
 
 用法: python eval/e26_e2e_truth.py
 """
@@ -21,14 +21,15 @@ from core.map_library import MapLibrary
 from core.vision import _find_icon, detect_fog_panel, load_bgr
 
 import tomllib
-_cfg = tomllib.load(open(ROOT / "config.toml", "rb"))["match"]
+_CFG = tomllib.load(open(ROOT / "config.toml", "rb"))
+_cfg = _CFG["match"]
 ALIGN_MAX = float(_cfg["align_score_max"])
 OV_MIN = float(_cfg["overlap_min"])
 SCORE_CONF = float(_cfg["score_confident"])
 MASK_MIN = float(_cfg["sample_mask_min"])
 LEAD_MIN = float(_cfg.get("lead_min", 0.25))
-SHOT_DIRS = [ROOT / "captures", Path(r"D:\Videos\NVIDIA\IdentityV")]
-lib = MapLibrary.load(r"D:\Pictures\20260818摸金地图")
+SHOT_DIRS = [ROOT / "captures", Path(_CFG["paths"]["shot_library"])]
+lib = MapLibrary.load(_CFG["paths"]["map_library"])
 
 
 def shot_path(f):
@@ -72,7 +73,7 @@ for row in csv.DictReader(open(ROOT / "eval" / "labels.csv", encoding="utf-8")):
         cur[f] = free[f] = ("图标未检出", 0, 0); continue
     struct = sample_structure(_crop_around_icon(shot, panel, ip, icon_k=ik))[1].mean()
     res, _p, _s, _k = find_seed_by_entrance(shot, lib, et, panel=panel, top_n=3)
-    # 结构闸的逃生门（2026-09-18，config [match].lead_min）：top1 领先次名够多就放行
+    # 结构闸的逃生门（config [match].lead_min）：top1 领先次名够多就放行
     lead = (1.0 if len(res) < 2 or res[1][0] <= 1e-9
             else (res[1][0] - res[0][0]) / res[1][0])
     gated = (struct < MASK_MIN and lead < LEAD_MIN) or not res

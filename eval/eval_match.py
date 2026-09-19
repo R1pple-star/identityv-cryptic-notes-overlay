@@ -4,10 +4,10 @@
 ================
 在「刚进入口」标注集(eval/labels.csv)上跑入口引索匹配 + 两段式对齐，报：
   [!] 分母只算「应答的那几张」—— 拒答被排除在外，头条数字偏乐观。
-  用户真实体验看 eval/e26_e2e_truth.py（"按下热键后屏幕上出现的东西"）。
+  端到端真实口径（"按下热键后屏幕上出现的东西"）看 eval/e26_e2e_truth.py。
   主集(is_entrance_view=1) top-1/top-3 准确率 + overlap 闸通过率
   控制组(is_entrance_view=0) 误报率(不该确信却确信了)
-路径从 config 读。每改动对着它跑(见 CLAUDE.md)。
+路径从 config 读，每改动对着它跑。
 
 labels.csv 列：file,seed,floor,entrance_type,is_entrance_view,notes
   file=截图文件名(相对 config.paths.shot_library)；seed=真种子；entrance_type=侧门/二楼/正门；
@@ -115,8 +115,8 @@ def evaluate_sample(shot, lib, entrance_type, gt_seed):
                     gate_pass=False, top1_correct=False, top3_correct=False, icon=isc,
                     degenerate=False, rejected=False)
     # 快速失败闸镜像（app._entrance_pipeline_impl 同款）：未探明样本 app 默认拒答，
-    # **但 2026-09-18 起有逃生门** —— 入口 top1 领先次名 ≥ lead_min 时放行（结构占比只是
-    # "能不能判"的代理，入口层判的是墙；依据 experiments/e34_evidence_gate.py）。
+    # 但有逃生门 —— 入口 top1 领先次名 ≥ lead_min 时放行（结构占比只是
+    # "能不能判"的代理，入口层判的是墙）。
     cls, mask = sample_structure(_crop_around_icon(shot, panel, ip, 0.18, icon_k=ik))
     if mask.mean() < SAMPLE_MASK_MIN and _lead(res) < LEAD_MIN:
         return dict(top3=[], best_seed=None, best_score=None, overlap=None,

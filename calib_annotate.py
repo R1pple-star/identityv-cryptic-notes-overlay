@@ -9,9 +9,8 @@
     python calib_annotate.py <截图路径> [--out 输出路径]
 输出默认存到 校准输出/ 目录，是个可看的 PNG。
 
-注：classify_region / _find_icon 原为本文件第三份拷贝（且已 drift：dark<52、
-单尺度阈值0.40，与 core/vision 的 dark<42、多尺度0.58 不一致）。Phase 2.3
-删本地拷贝，改 import core.vision 核心，消除 drift。
+注：classify_region / _find_icon 直接 import core.vision 的核心实现，
+不在本文件维护副本（副本必然 drift）。
 """
 from __future__ import annotations
 

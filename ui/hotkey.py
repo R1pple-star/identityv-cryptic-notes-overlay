@@ -6,7 +6,7 @@
 热键回调运行在 Qt 主线程的事件循环里，可直接更新 UI（无跨线程问题）。
 
 注册失败（如热键已被占用）抛 RuntimeError，含 Win GetLastError 中文含义，
-供 app.py 醒目提示（状态灯 + 弹窗），不再静默吞。回调异常也兜底，不冒泡到
+供 app.py 醒目提示（状态灯 + 弹窗），不静默吞。回调异常也兜底，不冒泡到
 nativeEventFilter（否则 Qt 静默吞，用户毫无感知）。
 """
 from __future__ import annotations

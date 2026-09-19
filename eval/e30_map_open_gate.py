@@ -3,7 +3,7 @@
 
 用法: python eval/e30_map_open_gate.py
 输出三块：
-  A. 两判据不一致的全部样本（旧开新关 = 修掉的误判；旧关新开 = 新引入的风险）
+  A. 两判据不一致的全部样本（旧开新关 = 旧判据的误判；旧关新开 = 新判据的风险）
   B. 已知负样本的逐张断言（真实游戏世界 / 桌面 / 黑屏）
   C. 走雾兜底的样本（nav 低但被判开）——这些是要人眼复核的
 """
@@ -20,7 +20,7 @@ from core.vision import (FOG_OPEN_MIN, NAV_NCC_MIN, follow_features, load_bgr,
 NVIDIA = Path(r"D:\Videos\NVIDIA\IdentityV")
 PANEL = panel_for_screen(1920, 1080)
 
-# 已知负样本（2026-09-17 逐张看图确认）
+# 已知负样本（逐张人工确认）
 NEG = {
     "IdentityV Screenshot 2026.08.25 - 20.02.47.44.png": "真实游戏世界(木楼梯)",
     "IdentityV Screenshot 2026.09.14 - 14.46.48.17.png": "真实游戏世界(走廊绿植)",

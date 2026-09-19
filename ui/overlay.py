@@ -19,7 +19,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QLabel, QWidget
 
 # 投影窗从截屏画面排除（屏上正常显示，但 mss/热键全屏截屏/OBS/录屏拍不到）。
-# 禁用 WDA_MONITOR(0x1)：全屏窗会整块变黑，热键全屏截屏全毁。e1 实验验证过 0x11。
+# 禁用 WDA_MONITOR(0x1)：全屏窗会整块变黑，热键全屏截屏全毁；用 WDA_EXCLUDEFROMCAPTURE(0x11)。
 WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
@@ -48,8 +48,7 @@ class MapOverlay(QWidget):
         self._label.setScaledContents(False)
 
         # 截屏排除：防自截污染——投影墙体若进截屏会被 classify 成 structure 混进样本/探明掩膜，
-        # 热键重匹配会吃到自己的投影（跟随的开合判定自 2026-09-17 起走导航列/雾，不再吃结构，
-        # 但**匹配**这条路径照样会被污染）。
+        # 热键重匹配会吃到自己的投影（开合判定走导航列/雾不受影响，但**匹配**路径照样会被污染）。
         # 注意：winId() 已强制创建原生窗，此后不得再 setWindowFlags（重建 HWND 丢 affinity）。
         self.capture_excluded = self._set_capture_exclusion() if exclude_capture else False
 

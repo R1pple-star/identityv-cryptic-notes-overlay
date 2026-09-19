@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""缩放滑条重标定（用户 2026-09-18 报「缩大小不准」）。
+"""缩放滑条重标定。
 
-现状表 `ZOOM_TABLE_Y/S` 只覆盖模板 y∈[382,708]（来自用户 09-17 那段视频），
-而 09-18 的演示证明圆点能走到 **y=752**（真尺度 0.83，图标锚点误差 5px + 图标尺子 0.39/0.45=0.87
-双重确认），且轨道一直延伸到 y≈790。⇒ 放大/缩小两端都够不着，读数被截断在 0.60。
+旧表 `ZOOM_TABLE_Y/S` 只覆盖模板 y∈[382,708]，而实测圆点能走到 **y=752**
+（真尺度 0.83，图标锚点误差 5px + 图标尺子 0.39/0.45=0.87 双重确认），
+且轨道一直延伸到 y≈790。⇒ 放大/缩小两端都够不着，读数被截断在 0.60。
 
 本脚本用**独立真值**重建标定：对标注集里每一张「刚进入口」的全屏帧，
   真尺度 = 让引索入口图标 ref 坐标经 M 映到屏幕实测图标位置、误差最小的那个 s
@@ -18,9 +18,12 @@ from pathlib import Path
 
 import numpy as np
 
+import tomllib
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+_CFG = tomllib.load(open(ROOT / "config.toml", "rb"))
 
 import cv2  # noqa: E402
 
@@ -30,12 +33,12 @@ from core.map_library import MapLibrary  # noqa: E402
 from core.vision import (NAV_BAND, _find_icon, load_bgr, nav_column_ncc,  # noqa: E402
                          panel_for_screen, roi_of)
 
-NVIDIA = Path(r"D:\Videos\NVIDIA\IdentityV")
+NVIDIA = Path(_CFG["paths"]["shot_library"])
 PANEL = panel_for_screen(1920, 1080)
 PX, PY, PW, PH = PANEL
 NX0, NY0, NX1, _NY1 = NAV_BAND
 X0, Y0 = PX + PW + NX0, PY + NY0
-LIB = MapLibrary.load(r"D:\Pictures\20260818摸金地图")
+LIB = MapLibrary.load(_CFG["paths"]["map_library"])
 SCAN = tuple(np.round(np.arange(0.15, 1.06, 0.05), 2))
 DOT_LO, DOT_HI = 315, 805                 # 加宽后的圆点窗（模板坐标）
 

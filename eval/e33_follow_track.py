@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """跟随·第二步（投影跟着地图平移/缩放）的离线断言 —— 复刻 app._track_tick 的判定链。
 
-**只用真实截图/视频帧**（CLAUDE.md 硬约束：禁用合成面板）。
+**只用真实截图/视频帧**（硬约束：禁用合成面板）。
 判定用**独立真值**：引索 json 的入口图标 cx/cy（参考图坐标）× `_find_icon`（屏幕坐标）——
 真对齐的 M 必须把前者映到后者（同一模板、同渲染器）。图标误差 <25px 才算对。
 
@@ -20,9 +20,12 @@ from pathlib import Path
 
 import numpy as np
 
+import tomllib
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+_CFG = tomllib.load(open(ROOT / "config.toml", "rb"))
 
 import cv2  # noqa: E402
 
@@ -34,11 +37,11 @@ from core.vision import (_find_icon, load_bgr, map_roi, nav_band, panel_for_scre
 from ui.track import (TRACK_DEADBAND_S, TRACK_MOTION_MAD, TRACK_NEAR_R, TRACK_OK,
                       Tracker, verdict)  # noqa: E402
 
-NVIDIA = Path(r"D:\Videos\NVIDIA\IdentityV")
+NVIDIA = Path(_CFG["paths"]["shot_library"])
 VIDEO = NVIDIA / "IdentityV 2026.09.14 - 14.53.02.02.mp4"
 CAP = ROOT / "captures"
 PANEL = panel_for_screen(1920, 1080)
-lib = MapLibrary.load(r"D:\Pictures\20260818摸金地图")
+lib = MapLibrary.load(_CFG["paths"]["map_library"])
 OVERLAP_MIN = 0.40
 ERR_OK = 25.0
 ok = []
@@ -91,7 +94,7 @@ def tick(shot, tr, ref, use_motion_gate=True, prev_small=None):
         if near is not None and sc_near < TRACK_OK and near[2] >= OVERLAP_MIN:
             tr.adopt(near[0], tr.s)
             return "接受-近处", near[0], tr.s, sc_near, near[2], f"小窗(±{TRACK_NEAR_R}px)内收敛"
-    # 没有可信尺度 ⇒ 不做全平移、就地判丢（与 app._track_tick 同款；2026-09-18 实测：
+    # 没有可信尺度 ⇒ 不做全平移、就地判丢（与 app._track_tick 同款：
     # 错尺度上全平移的全局极小能落在偏 840px 的位置，且分比真尺度还低 ⇒ 没有闸能拦）
     if s_ui is None:
         tr.note_lost()
@@ -134,7 +137,7 @@ print("=" * 84)
 print("2) 同种子真平移/缩放：从 A 的变换跟到 B（用**独立图标真值**判对错）")
 print("   ⚠️ 只用全屏帧（屏幕底行<60）：窗口化 capture 里游戏窗整体位移过，标称面板几何")
 print("      无效（实测导航列跑进面板内），那批不能当对齐真值。")
-# (A, B, seed, B 的真尺度= e35 用图标锚点扫描锁定的值)
+# (A, B, seed, B 的真尺度 = 图标锚点扫描锁定的值)
 PAIRS = [("2026.09.14 - 21.59.28.73", "2026.09.14 - 21.59.53.50", 10, 0.35),
          ("2026.09.14 - 21.58.00.06", "2026.09.14 - 21.58.05.01", 6, 0.35),
          ("hotkey_20260914_144715", "hotkey_20260914_145440", 2, 0.40),
@@ -175,7 +178,7 @@ print()
 print("=" * 84)
 print("3) 缩放（用户录的缩放演示视频）：滑条给的尺度能不能让投影跟上")
 cap = cv2.VideoCapture(str(VIDEO))
-FR = [(387, 0.25), (339, 0.30), (306, 0.45)]    # (帧号, e37 标定/验证过的真尺度)
+FR = [(387, 0.25), (339, 0.30), (306, 0.45)]    # (帧号, 标定/验证过的真尺度)
 shots, ref2 = {}, load_bgr(str(lib.get(2, "一楼").path))
 for i, s_true in FR:
     cap.set(cv2.CAP_PROP_POS_FRAMES, i)
